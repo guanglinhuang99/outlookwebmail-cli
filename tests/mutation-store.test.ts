@@ -34,6 +34,15 @@ describe('MutationStore', () => {
     await store.begin('request-pending', 'delete', hash, 'm_aaaaaaaaaaaaaaaaaaaa');
 
     await expect(store.prior('request-pending', 'delete', hash, '1'))
-      .rejects.toMatchObject({ code: 'OPERATION_FAILED' });
+      .rejects.toMatchObject({ code: 'OPERATION_UNKNOWN' });
+  });
+
+  it('preserves an uncertain result and forbids automatic retry', async () => {
+    const store = await createStore();
+    const hash = store.payloadHash('delete', { id: '1' });
+    await store.begin('request-unknown', 'delete', hash, 'm_aaaaaaaaaaaaaaaaaaaa');
+    await store.uncertain('request-unknown', 'PLAYWRIGHT_TIMEOUT', { action: 'delete', mailId: 'm_aaaaaaaaaaaaaaaaaaaa' });
+    await expect(store.prior('request-unknown', 'delete', hash, '1'))
+      .rejects.toMatchObject({ code: 'OPERATION_UNKNOWN', message: expect.stringContaining('禁止') });
   });
 });

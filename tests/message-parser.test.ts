@@ -1,6 +1,6 @@
 import { describe, expect, it, vi } from 'vitest';
 import type { BrowserBackend } from '../src/browser/backend.js';
-import { EgoMessageParser } from '../src/outlook/message-parser.js';
+import { buildMessageExtractScript, EgoMessageParser } from '../src/outlook/message-parser.js';
 
 const locator = {
   subject: '测试主题',
@@ -39,5 +39,12 @@ describe('EgoMessageParser', () => {
     } as unknown as BrowserBackend;
     const parser = new EgoMessageParser(backend);
     await expect(parser.openAndExtract(locator)).resolves.toEqual({ matchCount: 0, message: null });
+  });
+
+  it('reports body completeness and does not require a filename extension', () => {
+    const script = buildMessageExtractScript(locator);
+    expect(script).toContain('bodyTruncated');
+    expect(script).toContain('bodyBytes');
+    expect(script).not.toContain('a-z0-9]{2,8}');
   });
 });

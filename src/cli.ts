@@ -1,13 +1,21 @@
 #!/usr/bin/env node
 
-import { Command, CommanderError, InvalidArgumentError } from 'commander';
-import { EgoLiteBackend } from './browser/ego-lite.js';
+import { Command, CommanderError, InvalidArgumentError, Option } from 'commander';
+import { createBrowserBackend } from './browser/browser-factory.js';
 import { OutlookService } from './outlook/service.js';
 import { AppError, toAppError } from './util/errors.js';
 import { errorResult, successResult, writeJson, writePretty } from './util/output.js';
+import { watchMail } from './watch/mail-watcher.js';
 
 function requestedJson(argv: string[]): boolean {
   return argv.includes('--json');
+}
+
+function requestedMode(argv: string[]): string | undefined {
+  const equals = argv.find(argument => argument.startsWith('--mode='));
+  if (equals) return equals.slice('--mode='.length);
+  const index = argv.indexOf('--mode');
+  return index >= 0 ? argv[index + 1] : undefined;
 }
 
 function parseLimit(value: string): number {
@@ -23,6 +31,22 @@ function parseBoolean(value: string): boolean {
   if (normalized === 'true') return true;
   if (normalized === 'false') return false;
   throw new InvalidArgumentError('必须是 true 或 false');
+}
+
+function parseWatchInterval(value: string): number {
+  const interval = Number(value);
+  if (!Number.isInteger(interval) || interval < 5 || interval > 3_600) {
+    throw new InvalidArgumentError('必须是 5 到 3600 之间的整数秒');
+  }
+  return interval;
+}
+
+function parseIterations(value: string): number {
+  const iterations = Number(value);
+  if (!Number.isInteger(iterations) || iterations < 0) {
+    throw new InvalidArgumentError('必须是大于或等于 0 的整数');
+  }
+  return iterations;
 }
 
 function parseRecipients(value?: string): string[] {
@@ -46,18 +70,21 @@ async function execute<T>(json: boolean, operation: () => Promise<T>): Promise<v
   }
 }
 
-export function createProgram(service = new OutlookService(new EgoLiteBackend())): Command {
+export function createProgram(service = new OutlookService(createBrowserBackend())): Command {
   const program = new Command();
   program
     .name('webmail')
-    .description('Outlook Web CLI through Ego Lite')
-    .version('0.2.0')
+    .description('Outlook Web CLI through Playwright (Ego Lite fallback)')
+    .version('0.3.0')
+    .addOption(new Option('--mode <mode>', '运行模式；default 保持当前配置，egolite 全程使用 Ego Lite')
+      .choices(['default', 'egolite'])
+      .default('default'))
     .showHelpAfterError()
     .exitOverride();
 
   program
     .command('status')
-    .description('检查 Ego Lite 与 Outlook 登录状态')
+    .description('检查浏览器后端与 Outlook 登录状态')
     .option('--json', '输出单一 JSON envelope')
     .action(async (options: { json?: boolean }) => {
       await execute(Boolean(options.json), () => service.status());
@@ -65,7 +92,7 @@ export function createProgram(service = new OutlookService(new EgoLiteBackend())
 
   program
     .command('doctor')
-    .description('检查 Node、Ego Lite、登录状态和 Outlook DOM 兼容性')
+    .description('检查 Node、浏览器后端、登录状态和 Outlook DOM 兼容性')
     .option('--json', '输出单一 JSON envelope')
     .action(async (options: { json?: boolean }) => {
       await execute(Boolean(options.json), async () => {
@@ -423,6 +450,63 @@ export function createProgram(service = new OutlookService(new EgoLiteBackend())
     });
 
   program
+    .command('sync-obsidian')
+    .description('按日期和目录增量同步邮件到 Obsidian，重复运行会跳过未变化邮件')
+    .requiredOption('-o, --output <directory>', 'Obsidian Vault 中的目标目录')
+    .option('--date <date>', '指定日期；默认今天')
+    .option('--from-date <date>', '日期范围起点')
+    .option('--to-date <date>', '日期范围终点')
+    .option('--dir <directory>', 'Inbox 子目录')
+    .option('-n, --limit <number>', '每页邮件数', parseLimit, 20)
+    .option('--sender <text>', '发件人包含匹配')
+    .option('--subject <text>', '主题包含匹配')
+    .option('--unread', '只同步未读邮件')
+    .option('--has-attachments', '只同步带附件邮件')
+    .option('--json', '输出单一 JSON envelope')
+    .action(async (options: {
+      output: string; date?: string; fromDate?: string; toDate?: string; dir?: string; limit: number;
+      sender?: string; subject?: string; unread?: boolean; hasAttachments?: boolean; json?: boolean;
+    }) => {
+      await execute(Boolean(options.json), () => service.syncObsidian({
+        date: options.date, fromDate: options.fromDate, toDate: options.toDate, directory: options.dir,
+        limit: options.limit, sender: options.sender, subject: options.subject,
+        unread: Boolean(options.unread), hasAttachments: Boolean(options.hasAttachments),
+      }, options.output));
+    });
+
+  program
+    .command('watch')
+    .description('轮询今天的新邮件并逐行输出 JSONL；首次运行默认只建立基线')
+    .option('--dir <directory>', 'Inbox 子目录；默认 Inbox')
+    .option('--interval <seconds>', '轮询间隔秒数', parseWatchInterval, 30)
+    .option('--emit-existing', '首次运行也输出当前已有邮件')
+    .option('--state <path>', '自定义持久化状态文件')
+    .option('--iterations <number>', '轮询次数；0 表示持续运行', parseIterations, 0)
+    .action(async (options: {
+      dir?: string; interval: number; emitExisting?: boolean; state?: string; iterations: number;
+    }) => {
+      const controller = new AbortController();
+      const stop = () => controller.abort();
+      process.once('SIGINT', stop);
+      process.once('SIGTERM', stop);
+      try {
+        await watchMail(service, {
+          directory: options.dir,
+          intervalSeconds: options.interval,
+          emitExisting: Boolean(options.emitExisting),
+          statePath: options.state,
+          iterations: options.iterations,
+          signal: controller.signal,
+          onEvent: event => { process.stdout.write(`${JSON.stringify(event)}\n`); },
+          onStatus: event => { process.stdout.write(`${JSON.stringify(event)}\n`); },
+        });
+      } finally {
+        process.removeListener('SIGINT', stop);
+        process.removeListener('SIGTERM', stop);
+      }
+    });
+
+  program
     .command('move')
     .description('将邮件移动到完全匹配的 Outlook 目录')
     .argument('<id>', '列表返回的数字短 ID 或 stableId')
@@ -449,8 +533,12 @@ export function createProgram(service = new OutlookService(new EgoLiteBackend())
 }
 
 export async function main(argv = process.argv): Promise<void> {
+  let service: OutlookService | null = null;
   try {
-    await createProgram().parseAsync(argv);
+    const mode = requestedMode(argv);
+    const env = mode ? { ...process.env, WEBMAIL_MODE: mode } : process.env;
+    service = new OutlookService(createBrowserBackend({ env }));
+    await createProgram(service).parseAsync(argv);
   } catch (error) {
     if (error instanceof CommanderError) {
       if (error.code === 'commander.helpDisplayed' || error.code === 'commander.version') return;
@@ -459,7 +547,12 @@ export async function main(argv = process.argv): Promise<void> {
       if (requestedJson(argv)) writeJson(errorResult(appError));
       return;
     }
-    throw error;
+    const appError = toAppError(error);
+    process.exitCode = appError.exitCode;
+    if (requestedJson(argv)) writeJson(errorResult(appError));
+    else process.stderr.write(`[${appError.code}] ${appError.message}\n`);
+  } finally {
+    await service?.close().catch(() => undefined);
   }
 }
 

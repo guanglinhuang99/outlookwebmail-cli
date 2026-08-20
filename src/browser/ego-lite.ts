@@ -1,6 +1,6 @@
-import type { BrowserBackend } from './backend.js';
-import { EgoRunner } from './ego-runner.js';
-import type { BrowserStatus, InspectResult, LoginHandoffResult, MessageInspectResult, PageInfo } from '../types/inspect.js';
+import type { BrowserBackend, BrowserBackendName } from './backend.js';
+import { EgoRunner, type BrowserScriptRunner } from './ego-runner.js';
+import type { BrowserStatus, InspectResult, LoginHandoffResult, MailReadyProbe, MessageInspectResult, PageInfo } from '../types/inspect.js';
 import type {
   AttachmentDownloadResult,
   ComposeActionResult,
@@ -31,24 +31,45 @@ import {
 import { buildMessageExtractScript, buildMessageRowMatchScript } from '../outlook/message-parser.js';
 import { buildInboxFolderTargetScript, INBOX_FOLDER_SCAN_SCRIPT } from '../outlook/folder-parser.js';
 
-const TASK_SPACE = 'webmail-cli';
+const DEFAULT_TASK_SPACE = 'webmail-cli-production';
 const OUTLOOK_URL = 'https://partner.outlook.cn/mail/';
+const MAIL_READY_PROBE_SCRIPT = String.raw`(() => {
+  const visible = el => { const rect=el.getBoundingClientRect(); const style=getComputedStyle(el); return rect.width>0&&rect.height>0&&style.display!=='none'&&style.visibility!=='hidden'; };
+  const searchInputs = Array.from(document.querySelectorAll('input[role="combobox"]'))
+    .filter(visible).filter(el => /搜索|search/i.test((el.getAttribute('aria-label') || '') + ' ' + (el.getAttribute('placeholder') || '')));
+  const inboxFolders = Array.from(document.querySelectorAll('[role="treeitem"], [role="button"]'))
+    .filter(visible).filter(el => /收件箱|\binbox\b/i.test(((el.getAttribute('aria-label') || '') + ' ' + (el.textContent || '')).normalize('NFKC')));
+  const mailLists = Array.from(document.querySelectorAll('[role="listbox"]'))
+    .filter(visible).filter(el => /邮件列表|mail list/i.test(el.getAttribute('aria-label') || ''));
+  const loginFrames = Array.from(document.querySelectorAll('iframe')).filter(visible)
+    .filter(frame => /login|signin|auth|microsoftonline/i.test(frame.src || frame.title || ''));
+  const busy = Array.from(document.querySelectorAll('[aria-busy="true"], [role="progressbar"]')).some(visible);
+  return { ready: searchInputs.length === 1 && inboxFolders.length >= 1 && mailLists.length === 1 && loginFrames.length === 0 && !busy,
+    searchInputs: searchInputs.length, inboxFolders: inboxFolders.length, mailLists: mailLists.length, loginFrames: loginFrames.length, busy };
+})()`;
+const SEND_CONFIRMED_SCRIPT = String.raw`(() => {
+  const visible = el => { const rect=el.getBoundingClientRect(); const style=getComputedStyle(el); return rect.width>0&&rect.height>0&&style.display!=='none'&&style.visibility!=='hidden'; };
+  return Array.from(document.querySelectorAll('[role="status"], [role="alert"]')).filter(visible)
+    .some(el => /邮件已发送|已发送|message sent|sent successfully/i.test((el.innerText || el.textContent || '').normalize('NFKC')));
+})()`;
 
 function markedResult(expression: string): string {
   return `cliLog(JSON.stringify({ __webmail_result__: true, result: ${expression} }));`;
 }
 
 function bootstrap(): string {
+  const taskSpace = process.env.WEBMAIL_EGO_TASK_SPACE?.normalize('NFKC').trim() || DEFAULT_TASK_SPACE;
   return `
-const task = await useOrCreateTaskSpace(${JSON.stringify(TASK_SPACE)});
+const task = await useOrCreateTaskSpace(${JSON.stringify(taskSpace)});
 await openOrReuseTab(${JSON.stringify(OUTLOOK_URL)}, { wait: true, timeout: 30 });
 `;
 }
 
 function resumeTaskSpace(): string {
+  const taskSpace = process.env.WEBMAIL_EGO_TASK_SPACE?.normalize('NFKC').trim() || DEFAULT_TASK_SPACE;
   return `
-const task = await useOrCreateTaskSpace(${JSON.stringify(TASK_SPACE)});
-const tab = await ensureRealTab();
+const task = await useOrCreateTaskSpace(${JSON.stringify(taskSpace)});
+const tab = await openOrReuseTab(${JSON.stringify(OUTLOOK_URL)}, { wait: true, timeout: 30 });
 if (!tab) throw new Error('Outlook tab is unavailable');
 `;
 }
@@ -92,8 +113,42 @@ function actionFailure(opened: MessageOpenResult): MessageActionResult | null {
   };
 }
 
+function messageRemovalVerifiedScript(locator: MessageLocator, successPattern: string): string {
+  return String.raw`(() => {
+    const target = ${JSON.stringify(locator)};
+    const clean = value => (value || '').normalize('NFKC').replace(/\s+/g, ' ').trim().toLowerCase();
+    const visible = el => { const rect=el.getBoundingClientRect(); const style=getComputedStyle(el); return rect.width>0&&rect.height>0&&style.display!=='none'&&style.visibility!=='hidden'; };
+    const notices = Array.from(document.querySelectorAll('[role="status"], [role="alert"]')).filter(visible);
+    if (notices.some(el => new RegExp(${JSON.stringify(successPattern)}, 'i').test(clean(el.innerText || el.textContent)))) return true;
+    const roots = Array.from(document.querySelectorAll('[role="listbox"]')).filter(el => /邮件列表|mail list/i.test(el.getAttribute('aria-label') || ''));
+    if (roots.length !== 1) return false;
+    const rows = Array.from(roots[0].querySelectorAll('[role="option"]'));
+    return !rows.some(row => {
+      const stableHint = [row.getAttribute('data-item-id'), row.getAttribute('data-message-id'), row.getAttribute('data-convid'), row.getAttribute('data-conversation-id')]
+        .map(value => (value || '').normalize('NFKC').trim()).find(Boolean) || null;
+      if (target.stableHint && stableHint) return stableHint === target.stableHint;
+      const titled = Array.from(row.querySelectorAll('span[title]'));
+      const sender = titled.find(el => /^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(clean(el.getAttribute('title'))));
+      const time = titled.find(el => /(\d{4})[\/-](\d{1,2})[\/-](\d{1,2})\s+(\d{1,2}):(\d{2})/.test(el.getAttribute('title') || ''));
+      const subjectBlock = time ? time.parentElement : null;
+      const subject = subjectBlock ? Array.from(subjectBlock.children).find(el => el !== time && clean(el.textContent)) : null;
+      const preview = subjectBlock ? subjectBlock.nextElementSibling : null;
+      return clean(subject && subject.textContent) === clean(target.subject)
+        && (!target.senderAddress || clean(sender && sender.getAttribute('title')) === clean(target.senderAddress))
+        && (!target.receivedAtText || clean(time && time.textContent) === clean(target.receivedAtText))
+        && (!target.preview || clean(preview && preview.textContent) === clean(target.preview));
+    });
+  })()`;
+}
+
 export class EgoLiteBackend implements BrowserBackend {
-  constructor(private readonly runner = new EgoRunner()) {}
+  readonly name: BrowserBackendName = 'ego-lite';
+
+  constructor(protected readonly runner: BrowserScriptRunner = new EgoRunner()) {}
+
+  async close(): Promise<void> {
+    await this.runner.close?.();
+  }
 
   private async runComposeAction(
     options: ComposeOptions | ForwardOptions,
@@ -275,10 +330,7 @@ if (controlTarget.count !== 1 || !controlTarget.rect) {
           let closed = false;
           for (let attempt = 0; attempt < 30; attempt += 1) {
             await wait(0.3);
-            closed = await js(${JSON.stringify(String.raw`(() => {
-              const inViewport = el => { const rect = el.getBoundingClientRect(); return rect.width > 0 && rect.height > 0 && rect.bottom > 0 && rect.top < innerHeight; };
-              return !Array.from(document.querySelectorAll('[contenteditable="true"][role="textbox"][aria-label]')).filter(inViewport).some(el => /^(邮件正文|message body)$/i.test((el.getAttribute('aria-label') || '').trim()));
-            })()`)});
+            closed = await js(${JSON.stringify(SEND_CONFIRMED_SCRIPT)});
             if (closed) break;
           }
           ${markedResult(`{ status: closed ? 'sent' : 'send_not_verified', performed: true, verified: closed, draft: false, handedOff: false, attachmentCount: verified.attachmentCount, matchCount: ${JSON.stringify(matchCount)} }`)}
@@ -307,11 +359,28 @@ ${markedResult(`{
     return (await this.runner.run<BrowserStatus>(script, 40_000)).value;
   }
 
+  async waitUntilMailReady(timeoutMs = 30_000): Promise<MailReadyProbe> {
+    const attempts = Math.max(1, Math.ceil(timeoutMs / 500));
+    const script = `${bootstrap()}
+let probe = null;
+let page = null;
+for (let attempt = 0; attempt < ${JSON.stringify(attempts)}; attempt += 1) {
+  page = await pageInfo();
+  probe = await js(${JSON.stringify(MAIL_READY_PROBE_SCRIPT)});
+  if (probe.ready) break;
+  if (attempt + 1 < ${JSON.stringify(attempts)}) await wait(0.5);
+}
+${markedResult(`({ ...probe, url: page && page.url ? page.url : null, title: page && page.title ? page.title : null })`)}
+`;
+    return (await this.runner.run<MailReadyProbe>(script, timeoutMs + 10_000)).value;
+  }
+
   async handoffForLogin(): Promise<LoginHandoffResult> {
+    const taskSpace = process.env.WEBMAIL_EGO_TASK_SPACE?.normalize('NFKC').trim() || DEFAULT_TASK_SPACE;
     const script = `
-const task = await useOrCreateTaskSpace(${JSON.stringify(TASK_SPACE)});
-let tab = await ensureRealTab();
-if (!tab) tab = await openOrReuseTab(${JSON.stringify(OUTLOOK_URL)}, { wait: true, timeout: 30 });
+const task = await useOrCreateTaskSpace(${JSON.stringify(taskSpace)});
+const tab = await openOrReuseTab(${JSON.stringify(OUTLOOK_URL)}, { wait: true, timeout: 30 });
+if (!tab) throw new Error('Outlook tab is unavailable');
 const page = await pageInfo();
 const handoff = await handOffTaskSpace(task.id);
 ${markedResult(`{
@@ -567,31 +636,52 @@ if (target.count !== 1 || !target.rect || !target.folder) {
     const searchSelector = 'input[role="combobox"][aria-label^="搜索"], input[role="combobox"][aria-label^="Search"]';
     const exitSearchSelector = 'button[aria-label="退出搜索"], button[aria-label="Exit search"]';
     const script = `${bootstrap()}
-let searchReady = false;
-for (let attempt = 0; attempt < 20; attempt += 1) {
-  const searchCount = await js(${JSON.stringify(`(() => document.querySelectorAll(${JSON.stringify(searchSelector)}).length)()`)});
-  if (searchCount === 1) { searchReady = true; break; }
-  await wait(0.3);
-}
-if (!searchReady) throw new Error('Outlook search input did not become ready');
-const activeSearch = await js(${JSON.stringify(`(() => {
-  const input = document.querySelector(${JSON.stringify(searchSelector)});
-  return Boolean(input && input.value);
-})()`)});
-if (activeSearch) {
-  await click(${JSON.stringify(exitSearchSelector)});
-  await wait(0.8);
-}
-await fillInput(${JSON.stringify(searchSelector)}, ${JSON.stringify(locator.subject)});
-await pressKey('Enter');
-let initialScan = null;
-for (let attempt = 0; attempt < 20; attempt += 1) {
-  const scan = await js(${JSON.stringify(matchScript)});
-  if (scan.listCount === 1 && scan.matches.length > 0) {
-    initialScan = scan;
-    break;
+let initialScan = await js(${JSON.stringify(matchScript)});
+const currentStableMatch = Boolean(${JSON.stringify(locator.stableHint)})
+  && initialScan.listCount === 1 && initialScan.matches.length === 1;
+if (!currentStableMatch) {
+  let searchReady = false;
+  for (let attempt = 0; attempt < 20; attempt += 1) {
+    const searchCount = await js(${JSON.stringify(`(() => document.querySelectorAll(${JSON.stringify(searchSelector)}).length)()`)});
+    if (searchCount === 1) { searchReady = true; break; }
+    await wait(0.3);
   }
-  await wait(0.5);
+  if (!searchReady) throw new Error('Outlook search input did not become ready');
+  const activeSearch = await js(${JSON.stringify(`(() => {
+    const input = document.querySelector(${JSON.stringify(searchSelector)});
+    return Boolean(input && input.value);
+  })()`)});
+  if (activeSearch) {
+    await click(${JSON.stringify(exitSearchSelector)});
+    for (let attempt = 0; attempt < 20; attempt += 1) {
+      const cleared = await js(${JSON.stringify(`(() => {
+        const input = document.querySelector(${JSON.stringify(searchSelector)});
+        return Boolean(input && !input.value);
+      })()`)});
+      if (cleared) break;
+      await wait(0.25);
+    }
+  }
+  await fillInput(${JSON.stringify(searchSelector)}, ${JSON.stringify(locator.subject)});
+  await pressKey('Enter');
+  initialScan = null;
+  let previousKey = null;
+  let stablePolls = 0;
+  for (let attempt = 0; attempt < 30; attempt += 1) {
+    await wait(0.3);
+    const queryValue = await js(${JSON.stringify(`(() => {
+      const input = document.querySelector(${JSON.stringify(searchSelector)});
+      return input ? input.value : null;
+    })()`)});
+    const scan = await js(${JSON.stringify(matchScript)});
+    if (queryValue === ${JSON.stringify(locator.subject)} && scan.listCount === 1 && scan.matches.length > 0) {
+      stablePolls = scan.firstKey === previousKey ? stablePolls + 1 : 1;
+      if (stablePolls >= 2) { initialScan = scan; break; }
+    } else {
+      stablePolls = 0;
+    }
+    previousKey = scan.firstKey;
+  }
 }
 
 const seenMatches = new Map();
@@ -701,13 +791,7 @@ if (!control.rect) {
 } else {
   await click(control.rect);
   await wait(1);
-  const verified = await js(${JSON.stringify(`(() => {
-    const expected = ${JSON.stringify(locator.subject)}.normalize('NFKC').replace(/\\s+/g, ' ').trim();
-    const clean = value => (value || '').normalize('NFKC').replace(/\\s+/g, ' ').trim();
-    const pane = document.querySelector('[role="main"][aria-label="阅读窗格"], [role="main"][aria-label="Reading pane"]');
-    if (!pane) return true;
-    return !Array.from(pane.querySelectorAll('span[role="heading"]')).some(el => clean(el.textContent) === expected);
-  })()`)});
+  const verified = await js(${JSON.stringify(messageRemovalVerifiedScript(locator, '已删除|deleted|移至已删除|moved to deleted'))});
   ${markedResult("{ matchCount: 1, status: 'performed', performed: true, verified }")}
 }
 `;
@@ -753,10 +837,7 @@ if (!moveControl.rect) {
   } else {
     await click(target.rect);
     await wait(1);
-    const verified = await js(${JSON.stringify(String.raw`(() => {
-      const menus = Array.from(document.querySelectorAll('[role="menu"]'));
-      return !menus.some(el => /移动|move/i.test(el.getAttribute('aria-label') || '') && el.getBoundingClientRect().width > 0);
-    })()`)});
+    const verified = await js(${JSON.stringify(messageRemovalVerifiedScript(locator, '已移动|moved'))});
     ${markedResult("{ matchCount: 1, status: 'performed', performed: true, verified }")}
   }
 }
@@ -829,12 +910,7 @@ if (!moveControl.rect) {
   const rect = buttons[0].getBoundingClientRect();
   return { count: 1, rect: { x: rect.x + rect.width / 2, y: rect.y + rect.height / 2 } };
 })()`;
-    const editorClosedScript = String.raw`(() => {
-  const inViewport = el => { const rect = el.getBoundingClientRect(); return rect.width > 0 && rect.height > 0 && rect.bottom > 0 && rect.top < innerHeight; };
-  return !Array.from(document.querySelectorAll('[contenteditable="true"][role="textbox"][aria-label]'))
-    .filter(inViewport)
-    .some(el => /^(邮件正文|message body)$/i.test((el.getAttribute('aria-label') || '').normalize('NFKC').trim()));
-})()`;
+    const editorClosedScript = SEND_CONFIRMED_SCRIPT;
     const commonResult = `draft: ${JSON.stringify(draft)}, replyAll: ${JSON.stringify(replyAll)}`;
     const script = `${resumeTaskSpace()}
 const replyTarget = await js(${JSON.stringify(replyTargetScript)});
@@ -991,8 +1067,11 @@ if (target.count !== 1 || !target.rect || !target.folder) {
   }
   const attachmentRoots = Array.from((composerRoot || document).querySelectorAll('[role="listbox"]')).filter(inViewport).filter(el => /文件附件|attachments?/i.test(el.getAttribute('aria-label') || ''));
   const attachments = attachmentRoots.flatMap(root => Array.from(root.querySelectorAll('[role="option"]')).map(option => {
-    const filenameElement = Array.from(option.querySelectorAll('[title]')).find(el => /\.[a-z0-9]{2,8}$/i.test(clean(el.getAttribute('title'))));
-    const filename = clean(filenameElement && filenameElement.getAttribute('title'));
+    const rejected = value => /^(更多操作|more actions|下载|download|预览|preview|打开|open)$/i.test(value)
+      || /^\d+(?:\.\d+)?\s*(?:bytes?|[kmgt]b|字节)$/i.test(value);
+    const titles = Array.from(option.querySelectorAll('[title]')).map(el => clean(el.getAttribute('title'))).filter(value => value && !rejected(value));
+    const texts = (option.innerText || '').split(/\r?\n/).map(clean).filter(value => value && !rejected(value));
+    const filename = titles[0] || texts[0] || '';
     const sizeMatch = clean(option.innerText).match(/\b\d+(?:\.\d+)?\s*(?:bytes?|[kmgt]b|字节)\b/i);
     return { filename, sizeText: sizeMatch ? sizeMatch[0] : null };
   })).filter(item => item.filename);
@@ -1264,7 +1343,7 @@ if (!send) {
   let closed = false;
   for (let attempt = 0; attempt < 30; attempt += 1) {
     await wait(0.3);
-    closed = await js(${JSON.stringify(String.raw`(() => !Array.from(document.querySelectorAll('[contenteditable="true"][role="textbox"][aria-label]')).some(el => { const r=el.getBoundingClientRect(); return r.width>0&&r.height>0&&r.bottom>0&&r.top<innerHeight&&/^(邮件正文|message body)$/i.test((el.getAttribute('aria-label')||'').trim()); }))()`)});
+    closed = await js(${JSON.stringify(SEND_CONFIRMED_SCRIPT)});
     if (closed) break;
   }
   ${markedResult("{ status: closed ? 'sent' : 'send_not_verified', performed: true, verified: closed, draft: false, handedOff: false, attachmentCount: 0, matchCount: 1 }")}
@@ -1422,10 +1501,17 @@ const value = await js(${JSON.stringify(String.raw`(() => {
     const dateText = clean(dateHeading && dateHeading.textContent) || null;
     const dateMatch = (dateText || '').match(/(\d{4})[\/-](\d{1,2})[\/-](\d{1,2})\s+(\d{1,2}):(\d{2})/);
     const receivedAt = dateMatch ? new Date(Number(dateMatch[1]),Number(dateMatch[2])-1,Number(dateMatch[3]),Number(dateMatch[4]),Number(dateMatch[5])).toISOString() : null;
-    const bodyText = (documentElement.innerText || '').replace(/\r\n?/g,'\n').replace(/\u00a0/g,' ').replace(/[ \t]+\n/g,'\n').replace(/\n{3,}/g,'\n\n').trim().slice(0,100*1024);
+    const body = (documentElement.innerText || '').replace(/\r\n?/g,'\n').replace(/\u00a0/g,' ').replace(/[ \t]+\n/g,'\n').replace(/\n{3,}/g,'\n\n').trim();
+    const bodyEncoded = new TextEncoder().encode(body);
+    let bodyText = body;
+    if (bodyEncoded.length > 100*1024) {
+      let output=''; let bytes=0; const encoder=new TextEncoder();
+      for (const character of body) { const size=encoder.encode(character).length; if (bytes+size>100*1024) break; output+=character; bytes+=size; }
+      bodyText=output;
+    }
     const attachmentRoots = Array.from(container.querySelectorAll('[role="listbox"]')).filter(el=>/文件附件|attachments?/i.test(el.getAttribute('aria-label')||''));
-    const attachments = attachmentRoots.flatMap(root=>Array.from(root.querySelectorAll('[role="option"]')).map(option=>{const filenameElement=Array.from(option.querySelectorAll('[title]')).find(el=>/\.[a-z0-9]{2,8}$/i.test(clean(el.getAttribute('title'))));const filename=clean(filenameElement&&filenameElement.getAttribute('title'));const sizeMatch=clean(option.innerText).match(/\b\d+(?:\.\d+)?\s*(?:bytes?|[kmgt]b|字节)\b/i);return{filename,sizeText:sizeMatch?sizeMatch[0]:null}})).filter(item=>item.filename);
-    return { subject: fallbackSubject, fromName: clean(fromElement&&fromElement.textContent)||null, fromAddress: fallbackSenderAddress, to: recipients(toHeading), cc: recipients(ccHeading), receivedAt, receivedAtText: dateText, bodyText, attachments };
+    const attachments = attachmentRoots.flatMap(root=>Array.from(root.querySelectorAll('[role="option"]')).map(option=>{const rejected=value=>/^(更多操作|more actions|下载|download|预览|preview|打开|open)$/i.test(value)||/^\d+(?:\.\d+)?\s*(?:bytes?|[kmgt]b|字节)$/i.test(value);const titles=Array.from(option.querySelectorAll('[title]')).map(el=>clean(el.getAttribute('title'))).filter(value=>value&&!rejected(value));const texts=(option.innerText||'').split(/\r?\n/).map(clean).filter(value=>value&&!rejected(value));const filename=titles[0]||texts[0]||'';const sizeMatch=clean(option.innerText).match(/\b\d+(?:\.\d+)?\s*(?:bytes?|[kmgt]b|字节)\b/i);return{filename,sizeText:sizeMatch?sizeMatch[0]:null}})).filter(item=>item.filename);
+    return { subject: fallbackSubject, fromName: clean(fromElement&&fromElement.textContent)||null, fromAddress: fallbackSenderAddress, to: recipients(toHeading), cc: recipients(ccHeading), receivedAt, receivedAtText: dateText, bodyText, bodyTruncated: bodyEncoded.length>100*1024, bodyBytes: bodyEncoded.length, attachments };
   }).filter(message=>message.bodyText);
   const expandable = Array.from(pane.querySelectorAll('[aria-expanded="false"]')).filter(el=>/展开|expand|show/i.test((el.getAttribute('aria-label')||el.getAttribute('title')||'').normalize('NFKC')));
   return { messages, complete: expandable.length===0 };
@@ -1453,11 +1539,14 @@ ${markedResult('{ matchCount: 1, messages: value.messages, complete: value.compl
   const options = lists.flatMap(list => Array.from(list.querySelectorAll('[role="option"]'))).filter(visible);
   const option = options[index];
   if (!option) return { count: options.length, target: null };
-  const filenameElement = Array.from(option.querySelectorAll('[title]')).find(el => /\\.[a-z0-9]{2,8}$/i.test(clean(el.getAttribute('title'))));
+  const rejected = value => /^(更多操作|more actions|下载|download|预览|preview|打开|open)$/i.test(value)
+    || /^\\d+(?:\\.\\d+)?\\s*(?:bytes?|[kmgt]b|字节)$/i.test(value);
+  const titles = Array.from(option.querySelectorAll('[title]')).map(el => clean(el.getAttribute('title'))).filter(value => value && !rejected(value));
+  const texts = (option.innerText || '').split(/\\r?\\n/).map(clean).filter(value => value && !rejected(value));
   const button = Array.from(option.querySelectorAll('button')).find(el => /更多操作|more actions/i.test((el.getAttribute('aria-label') || '') + ' ' + (el.getAttribute('title') || '')));
   if (!button) return { count: options.length, target: null };
   const rect = button.getBoundingClientRect();
-  return { count: options.length, target: { filename: clean(filenameElement && filenameElement.getAttribute('title')), rect: { x: rect.x + rect.width / 2, y: rect.y + rect.height / 2 } } };
+  return { count: options.length, target: { filename: titles[0] || texts[0] || '', rect: { x: rect.x + rect.width / 2, y: rect.y + rect.height / 2 } } };
 })()`;
     const downloadControlScript = String.raw`(() => {
   const visible = el => { const rect = el.getBoundingClientRect(); return rect.width > 0 && rect.height > 0; };

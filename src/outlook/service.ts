@@ -22,6 +22,7 @@ import type {
   MessageLocator,
   MessageStateActionResult,
   ObsidianExportResult,
+  ObsidianSyncResult,
   RawMessageRow,
   ReplyActionResult,
   ReplyResult,
@@ -33,7 +34,7 @@ import { EgoInboxParser, type InboxParser } from './inbox-parser.js';
 import { EgoMessageParser, type MessageParser } from './message-parser.js';
 import { FolderParser } from './folder-parser.js';
 import { SessionStore } from '../session/session-store.js';
-import { detectOutlookState } from './state.js';
+import { detectOutlookState, isAllowedOutlookUrl } from './state.js';
 import { MutationStore } from '../safety/mutation-store.js';
 import {
   attachmentLink,
@@ -41,6 +42,7 @@ import {
   renderObsidianMarkdown,
   writeMarkdownAtomically,
 } from '../export/obsidian.js';
+import { syncObsidian } from '../sync/obsidian-sync.js';
 
 const SEARCH_SELECTOR = 'input[role="combobox"][aria-label^="搜索"], input[role="combobox"][aria-label^="Search"]';
 const EXIT_SEARCH_SELECTOR = 'button[aria-label="退出搜索"], button[aria-label="Exit search"]';
@@ -51,15 +53,19 @@ const SEARCH_STATE_SCRIPT = String.raw`
   return { count: inputs.length, value: inputs.length === 1 ? inputs[0].value : null };
 })()
 `;
-const DOCTOR_DOM_SCRIPT = String.raw`
+const SEARCH_RESULT_STATE_SCRIPT = String.raw`
 (() => {
-  const searchInputs = Array.from(document.querySelectorAll('input[role="combobox"]'))
+  const clean = value => (value || '').normalize('NFKC').replace(/\s+/g, ' ').trim();
+  const inputs = Array.from(document.querySelectorAll('input[role="combobox"]'))
     .filter(el => /搜索|search/i.test((el.getAttribute('aria-label') || '') + ' ' + (el.getAttribute('placeholder') || '')));
-  const mailLists = Array.from(document.querySelectorAll('[role="listbox"]'))
+  const lists = Array.from(document.querySelectorAll('[role="listbox"]'))
     .filter(el => /邮件列表|mail list/i.test(el.getAttribute('aria-label') || ''));
-  const readingPanes = Array.from(document.querySelectorAll('[role="main"]'))
-    .filter(el => /阅读窗格|reading pane/i.test(el.getAttribute('aria-label') || ''));
-  return { searchInputs: searchInputs.length, mailLists: mailLists.length, readingPanes: readingPanes.length };
+  const first = lists.length === 1 ? lists[0].querySelector('[role="option"]') : null;
+  const busy = Array.from(document.querySelectorAll('[aria-busy="true"], [role="progressbar"]'))
+    .some(el => { const rect=el.getBoundingClientRect(); return rect.width>0&&rect.height>0; });
+  const empty = /未找到结果|无结果|no results|nothing found/i.test(document.body.innerText || '');
+  return { count: inputs.length, value: inputs.length === 1 ? inputs[0].value : null, listCount: lists.length,
+    firstKey: first ? clean(first.id || first.getAttribute('aria-label') || first.textContent).slice(0, 500) : null, busy, empty };
 })()
 `;
 
@@ -68,10 +74,29 @@ interface SearchState {
   value: string | null;
 }
 
-interface DoctorDomInventory {
-  searchInputs: number;
-  mailLists: number;
-  readingPanes: number;
+interface SearchResultState extends SearchState {
+  listCount: number;
+  firstKey: string | null;
+  busy: boolean;
+  empty: boolean;
+}
+
+type RowBuckets = Map<string, RawMessageRow[]>;
+
+function mergeVirtualPage(target: RowBuckets, rows: RawMessageRow[]): void {
+  const pageOccurrences = new Map<string, number>();
+  for (const row of rows) {
+    const fingerprint = messageFingerprint(row);
+    const occurrence = pageOccurrences.get(fingerprint) ?? 0;
+    pageOccurrences.set(fingerprint, occurrence + 1);
+    const bucket = target.get(fingerprint) ?? [];
+    if (!bucket[occurrence]) bucket[occurrence] = row;
+    target.set(fingerprint, bucket);
+  }
+}
+
+function flattenRowBuckets(buckets: RowBuckets): RawMessageRow[] {
+  return Array.from(buckets.values()).flat();
 }
 
 export interface InboxOptions {
@@ -91,6 +116,9 @@ export interface DatedMailListResult extends MailListResult {
   toDate: string;
   nextCursor: string | null;
   hasMore: boolean;
+  complete: boolean;
+  searchQuery: string | null;
+  scope: 'selected-folder';
   filters: {
     sender: string | null;
     subject: string | null;
@@ -250,8 +278,18 @@ export class OutlookService {
     this.folderParser = new FolderParser(backend);
   }
 
-  private locatorForRow(row: RawMessageRow): MessageLocator {
+  private backendName(): 'ego-lite' | 'playwright' {
+    return this.backend.name ?? 'ego-lite';
+  }
+
+  async close(): Promise<void> {
+    await this.backend.close?.();
+  }
+
+  private locatorForRow(row: RawMessageRow, stableId?: string): MessageLocator {
     return {
+      stableHint: row.stableHint,
+      stableId,
       subject: row.subject,
       senderName: row.senderName,
       senderAddress: row.senderAddress,
@@ -259,13 +297,27 @@ export class OutlookService {
       receivedAtText: row.receivedAtText,
       preview: row.preview,
       hasAttachments: row.hasAttachments,
+      unread: row.unread,
     };
   }
 
-  private summaryForRow(row: RawMessageRow, id: string): MailSummary {
+  private summariesForRows(rows: RawMessageRow[], firstId = 1): MailSummary[] {
+    const collisions = new Map<string, number>();
+    return rows.map((row, index) => {
+      const baseStableId = stableMessageId(row);
+      const occurrence = collisions.get(baseStableId) ?? 0;
+      collisions.set(baseStableId, occurrence + 1);
+      const stableId = occurrence === 0
+        ? baseStableId
+        : stableMessageId({ ...row, stableHint: `collision:${baseStableId}:${occurrence}` });
+      return this.summaryForRow(row, String(firstId + index), stableId);
+    });
+  }
+
+  private summaryForRow(row: RawMessageRow, id: string, stableId = stableMessageId(row)): MailSummary {
     return {
       id,
-      stableId: stableMessageId(row),
+      stableId,
       sender: { name: row.senderName, address: row.senderAddress },
       subject: row.subject,
       receivedAt: row.receivedAt,
@@ -276,20 +328,26 @@ export class OutlookService {
     };
   }
 
-  private async writeListSession(source: string, messages: MailSummary[], rows: RawMessageRow[]): Promise<void> {
+  private async writeListSession(
+    source: string,
+    messages: MailSummary[],
+    rows: RawMessageRow[],
+    metadata: { query?: string | null; directory?: string | null; complete?: boolean } = {},
+  ): Promise<void> {
     const previous = await this.sessionStore.read();
     const stableEntries = new Map(Object.entries(previous?.stableMessages ?? {}));
-    for (const row of rows) {
-      const stableId = stableMessageId(row);
+    for (const [index, row] of rows.entries()) {
+      const stableId = messages[index]!.stableId;
       stableEntries.delete(stableId);
-      stableEntries.set(stableId, this.locatorForRow(row));
+      stableEntries.set(stableId, this.locatorForRow(row, stableId));
     }
     while (stableEntries.size > 1_000) stableEntries.delete(stableEntries.keys().next().value!);
     await this.sessionStore.write({
       version: 1,
       updatedAt: new Date().toISOString(),
       source,
-      messages: Object.fromEntries(messages.map((message, index) => [message.id, this.locatorForRow(rows[index]!)])),
+      ...metadata,
+      messages: Object.fromEntries(messages.map((message, index) => [message.id, this.locatorForRow(rows[index]!, message.stableId)])),
       stableMessages: Object.fromEntries(stableEntries),
     });
   }
@@ -297,6 +355,29 @@ export class OutlookService {
   private async ensureReady(): Promise<void> {
     const observation = await this.backend.status();
     await this.requireAuthenticatedPage(observation.page, observation.snapshot);
+    await this.requireMailReady();
+  }
+
+  private async requireMailReady(): Promise<void> {
+    const probe = await this.backend.waitUntilMailReady(30_000);
+    if (probe.ready) return;
+    if (!isAllowedOutlookUrl(probe.url)) {
+      await this.requireAuthenticatedPage({ url: probe.url ?? undefined }, '');
+    }
+    const diagnosticUrl = (() => {
+      try {
+        const url = new URL(probe.url ?? '');
+        return `${url.protocol}//${url.host}${url.pathname}`;
+      } catch {
+        return '<unknown>';
+      }
+    })();
+    throw new AppError(
+      'OUTLOOK_NOT_READY',
+      `Outlook 邮件页面尚未就绪。URL=${diagnosticUrl}；标题=${probe.title ?? '<unknown>'}；` +
+      `搜索框=${probe.searchInputs}，Inbox=${probe.inboxFolders}，邮件列表=${probe.mailLists}，登录 iframe=${probe.loginFrames}，busy=${probe.busy}。` +
+      '请等待页面加载完成；若仍停留在登录页，请在浏览器中完成登录后重试。',
+    );
   }
 
   private async requireAuthenticatedPage(
@@ -306,23 +387,31 @@ export class OutlookService {
     const url = requirePageUrl(page);
     if (detectOutlookState(url, snapshot) !== 'AUTH_REQUIRED') return url;
 
+    const backendName = this.backendName();
+
     try {
       const handoff = await this.backend.handoffForLogin();
       if (handoff.handedOff) {
         throw new AppError(
           'AUTH_REQUIRED',
-          '已在 Ego Lite 中打开 Outlook 并将页面交给你。请完成登录，再将控制权交还给 Agent，然后重新执行命令。',
+          backendName === 'playwright'
+            ? '已在 Playwright 浏览器中打开 Outlook。请完成登录，然后重新执行命令。'
+            : '已在 Ego Lite 中打开 Outlook 并将页面交给你。请完成登录，再将控制权交还给 Agent，然后重新执行命令。',
         );
       }
       throw new AppError(
         'AUTH_REQUIRED',
-        '已在 Ego Lite 中打开 Outlook，但未能把页面控制权交给你；请打开 Ego Lite 完成登录后重试。',
+        backendName === 'playwright'
+          ? '已打开 Outlook，但浏览器窗口不可交互；请设置 WEBMAIL_HEADLESS=false 后完成登录。'
+          : '已在 Ego Lite 中打开 Outlook，但未能把页面控制权交给你；请打开 Ego Lite 完成登录后重试。',
       );
     } catch (error) {
       if (error instanceof AppError && error.code === 'AUTH_REQUIRED') throw error;
       throw new AppError(
         'AUTH_REQUIRED',
-        'Outlook 尚未登录；已尝试在 Ego Lite 中打开登录页面，但控制权交接失败。请打开 Ego Lite 登录后重试。',
+        backendName === 'playwright'
+          ? 'Outlook 尚未登录；Playwright 无法打开登录页面，请检查浏览器配置后重试。'
+          : 'Outlook 尚未登录；已尝试在 Ego Lite 中打开登录页面，但控制权交接失败。请打开 Ego Lite 登录后重试。',
         { cause: error },
       );
     }
@@ -339,30 +428,60 @@ export class OutlookService {
   private async clearSearch(): Promise<void> {
     const state = await this.searchState();
     if (!state.value) return;
-    await this.backend.clickAndWait(EXIT_SEARCH_SELECTOR, 1_000);
-    const clearedState = await this.searchState();
-    if (clearedState.value) {
-      throw new AppError('UI_CHANGED', '已点击 Outlook 的退出搜索按钮，但搜索状态仍未清除。');
+    await this.backend.clickAndWait(EXIT_SEARCH_SELECTOR, 0);
+    for (let attempt = 0; attempt < 20; attempt += 1) {
+      const clearedState = await this.searchState();
+      if (!clearedState.value) return;
+      await this.backend.wait(250);
     }
+    throw new AppError('OUTLOOK_NOT_READY', '已点击 Outlook 的退出搜索按钮，但搜索状态在 5 秒内仍未清除。');
+  }
+
+  private async submitSearch(query: string): Promise<void> {
+    await this.searchState();
+    await this.backend.fillAndPress(SEARCH_SELECTOR, query, 'Enter', 0);
+    let previousFingerprint: string | null = null;
+    let stablePolls = 0;
+    let last: SearchResultState | null = null;
+    for (let attempt = 0; attempt < 40; attempt += 1) {
+      last = await this.backend.eval<SearchResultState>(SEARCH_RESULT_STATE_SCRIPT);
+      if (last.count !== 1) throw new AppError('UI_CHANGED', `预期找到 1 个 Outlook 搜索框，实际找到 ${last.count} 个。`);
+      const fingerprint = `${last.listCount}:${last.firstKey ?? '<empty>'}:${last.empty}`;
+      if (last.value === query && !last.busy && (last.listCount === 1 || last.empty)) {
+        stablePolls = fingerprint === previousFingerprint ? stablePolls + 1 : 1;
+        if (stablePolls >= 2) return;
+      } else {
+        stablePolls = 0;
+      }
+      previousFingerprint = fingerprint;
+      await this.backend.wait(250);
+    }
+    throw new AppError(
+      'OUTLOOK_NOT_READY',
+      `Outlook 搜索结果在 10 秒内未稳定。query=${JSON.stringify(query)}；value=${JSON.stringify(last?.value ?? null)}；` +
+      `mailLists=${last?.listCount ?? 0}；busy=${last?.busy ?? false}；empty=${last?.empty ?? false}。`,
+    );
   }
 
   private async collectRows(target: number, resetScroll: boolean): Promise<RawMessageRow[]> {
-    const rowsByFingerprint = new Map<string, RawMessageRow>();
+    const rowsByFingerprint: RowBuckets = new Map();
     let rows = resetScroll ? await this.inboxParser.resetAndExtract() : await this.inboxParser.extract();
     for (let attempt = 0; attempt <= 5; attempt += 1) {
-      for (const row of rows) {
-        const fingerprint = messageFingerprint(row);
-        if (!rowsByFingerprint.has(fingerprint)) rowsByFingerprint.set(fingerprint, row);
-      }
+      mergeVirtualPage(rowsByFingerprint, rows);
 
-      if (rowsByFingerprint.size >= target || attempt === 5) break;
+      if (flattenRowBuckets(rowsByFingerprint).length >= target || attempt === 5) break;
       rows = await this.inboxParser.scrollAndExtract();
     }
 
-    return Array.from(rowsByFingerprint.values()).slice(0, 100);
+    return flattenRowBuckets(rowsByFingerprint).slice(0, 100);
   }
 
-  private async list(source: string, options: InboxOptions, directory: FolderSummary | null): Promise<MailListResult> {
+  private async list(
+    source: string,
+    options: InboxOptions,
+    directory: FolderSummary | null,
+    metadata: { query?: string | null; complete?: boolean } = {},
+  ): Promise<MailListResult> {
     if (!Number.isInteger(options.limit) || options.limit < 1 || options.limit > 100) {
       throw new AppError('INVALID_ARGUMENT', '--limit 必须是 1 到 100 之间的整数。');
     }
@@ -371,8 +490,12 @@ export class OutlookService {
     const rawRows = await this.collectRows(collectionTarget, true);
     const selectedRows = (options.unreadOnly ? rawRows.filter(row => row.unread === true) : rawRows)
       .slice(0, options.limit);
-    const messages = selectedRows.map((row, index) => this.summaryForRow(row, String(index + 1)));
-    await this.writeListSession(source, messages, selectedRows);
+    const messages = this.summariesForRows(selectedRows);
+    await this.writeListSession(source, messages, selectedRows, {
+      directory: directory?.path ?? null,
+      complete: false,
+      ...metadata,
+    });
 
     return { directory, messages };
   }
@@ -397,11 +520,16 @@ export class OutlookService {
   async status(): Promise<StatusResult> {
     const observation = await this.backend.status();
     const url = await this.requireAuthenticatedPage(observation.page, observation.snapshot);
+    await this.requireMailReady();
+    const detectedState = detectOutlookState(url, observation.snapshot);
     return {
-      backend: 'ego-lite',
+      backend: this.backendName(),
+      browser: observation.browserName ?? null,
       url,
       title: observation.title,
-      state: detectOutlookState(url, observation.snapshot),
+      state: detectedState === 'UNKNOWN' ? 'INBOX' : detectedState,
+      mailReady: true,
+      browserSession: observation.browserSession ?? null,
     };
   }
 
@@ -417,14 +545,18 @@ export class OutlookService {
     let observation;
     try {
       observation = await this.backend.status();
+      const backendName = this.backendName();
+      const backendLabel = backendName === 'playwright' ? 'Playwright' : 'Ego Lite';
       checks.push({
-        name: 'ego-lite',
+        name: backendName,
         status: observation.connected ? 'pass' : 'fail',
-        message: observation.connected ? 'Ego Lite 已连接。' : 'Ego Lite 未连接。',
+        message: observation.connected ? `${backendLabel} 已连接。` : `${backendLabel} 未连接。`,
       });
       if (!observation.connected) return { ok: false, checks };
     } catch (error) {
-      checks.push({ name: 'ego-lite', status: 'fail', message: `Ego Lite 检查失败：${error instanceof Error ? error.message : String(error)}` });
+      const backendName = this.backendName();
+      const backendLabel = backendName === 'playwright' ? 'Playwright' : 'Ego Lite';
+      checks.push({ name: backendName, status: 'fail', message: `${backendLabel} 检查失败：${error instanceof Error ? error.message : String(error)}` });
       return { ok: false, checks };
     }
 
@@ -437,22 +569,22 @@ export class OutlookService {
     }
     const state = detectOutlookState(url, observation.snapshot);
     if (state === 'AUTH_REQUIRED') {
-      checks.push({ name: 'authentication', status: 'fail', message: 'Outlook 尚未登录；请在 Ego Lite 中登录后重试。' });
+      const location = this.backendName() === 'playwright' ? 'Playwright 浏览器' : 'Ego Lite';
+      checks.push({ name: 'authentication', status: 'fail', message: `Outlook 尚未登录；请在${location}中登录后重试。` });
       return { ok: false, checks };
     }
-    checks.push({ name: 'authentication', status: 'pass', message: `Outlook 已登录，当前状态：${state}。` });
-
+    let ready = false;
+    let domMessage = 'DOM 尚未检查。';
     try {
-      const dom = await this.backend.eval<DoctorDomInventory>(DOCTOR_DOM_SCRIPT);
-      const valid = dom.searchInputs === 1;
-      checks.push({
-        name: 'dom',
-        status: valid ? (dom.mailLists > 0 ? 'pass' : 'warn') : 'fail',
-        message: `DOM：搜索框 ${dom.searchInputs}，邮件列表 ${dom.mailLists}，阅读窗格 ${dom.readingPanes}。`,
-      });
+      const probe = await this.backend.waitUntilMailReady(30_000);
+      ready = probe.ready;
+      domMessage = `DOM：搜索框 ${probe.searchInputs}，Inbox ${probe.inboxFolders}，邮件列表 ${probe.mailLists}，登录 iframe ${probe.loginFrames}，busy=${probe.busy}。`;
     } catch (error) {
-      checks.push({ name: 'dom', status: 'fail', message: `DOM 检查失败：${error instanceof Error ? error.message : String(error)}` });
+      domMessage = `DOM 等待失败：${error instanceof Error ? error.message : String(error)}`;
     }
+    checks.push({ name: 'authentication', status: ready ? 'pass' : 'warn', message: ready ? `Outlook 已登录，当前状态：${state}。` : 'Outlook 地址可访问，但邮件页面尚未就绪。' });
+    checks.push({ name: 'dom', status: ready ? 'pass' : 'fail', message: domMessage });
+
     return { ok: checks.every(check => check.status !== 'fail'), checks };
   }
 
@@ -460,7 +592,7 @@ export class OutlookService {
     const observation = await this.backend.inspect();
     const url = await this.requireAuthenticatedPage(observation.page, observation.snapshot);
     return {
-      backend: 'ego-lite',
+      backend: this.backendName(),
       capturedAt: new Date().toISOString(),
       state: detectOutlookState(url, observation.snapshot),
       ...observation,
@@ -471,7 +603,7 @@ export class OutlookService {
     const observation = await this.backend.inspectMessage();
     const url = await this.requireAuthenticatedPage(observation.page, observation.snapshot);
     return {
-      backend: 'ego-lite',
+      backend: this.backendName(),
       capturedAt: new Date().toISOString(),
       state: detectOutlookState(url, observation.snapshot),
       ...observation,
@@ -489,9 +621,9 @@ export class OutlookService {
     const normalizedQuery = query.normalize('NFKC').trim();
     if (!normalizedQuery) throw new AppError('INVALID_ARGUMENT', '搜索内容不能为空。');
     await this.ensureReady();
-    await this.searchState();
-    await this.backend.fillAndPress(SEARCH_SELECTOR, normalizedQuery, 'Enter', 1_500);
-    return await this.list(`search:${normalizedQuery}`, options, null);
+    await this.clearSearch();
+    await this.submitSearch(normalizedQuery);
+    return await this.list(`search:${normalizedQuery}`, options, null, { query: normalizedQuery, complete: false });
   }
 
   async listByDate(options: DatedMailListOptions = {}): Promise<DatedMailListResult> {
@@ -505,6 +637,8 @@ export class OutlookService {
     await this.ensureReady();
     await this.clearSearch();
     const directory = await this.selectDirectory(options.directory);
+    const searchQuery = window.date ? `received:${window.date}` : null;
+    if (searchQuery) await this.submitSearch(searchQuery);
     const scope = createHash('sha256').update(JSON.stringify({
       directory: directory.path,
       ...window,
@@ -515,48 +649,60 @@ export class OutlookService {
     })).digest('base64url').slice(0, 20);
     const offset = decodeCursor(options.cursor, scope);
     const target = offset + limit + 1;
-    const matchingRows = new Map<string, RawMessageRow>();
+    const matchingRows: RowBuckets = new Map();
     let rows = await this.inboxParser.resetAndExtract();
     let previousPage = '';
-    let complete = false;
+    let scanComplete = false;
+    let sawRows = false;
+    let sawParsedDate = false;
     for (let attempt = 0; attempt < 100; attempt += 1) {
+      const filteredRows: RawMessageRow[] = [];
       for (const row of rows) {
+        sawRows = true;
         const receivedDate = row.receivedAt?.slice(0, 10) ?? null;
+        if (receivedDate) sawParsedDate = true;
         if (!receivedDate || receivedDate < window.fromDate || receivedDate > window.toDate) continue;
         if (sender && !normalizeText(row.senderAddress || row.senderName).includes(normalizeText(sender))) continue;
         if (subject && !normalizeText(row.subject).includes(normalizeText(subject))) continue;
         if (options.unread && row.unread !== true) continue;
         if (options.hasAttachments && row.hasAttachments !== true) continue;
-        matchingRows.set(messageFingerprint(row), row);
+        filteredRows.push(row);
       }
-      if (matchingRows.size >= target) {
-        complete = true;
+      mergeVirtualPage(matchingRows, filteredRows);
+      if (flattenRowBuckets(matchingRows).length >= target) {
         break;
       }
       if (rows.some(row => row.receivedAt && row.receivedAt.slice(0, 10) < window.fromDate)) {
-        complete = true;
+        scanComplete = true;
         break;
       }
       const page = rows.map(messageFingerprint).join('\u001e');
       if (!rows.length || page === previousPage) {
-        complete = true;
+        scanComplete = true;
         break;
       }
       previousPage = page;
       rows = await this.inboxParser.scrollAndExtract();
     }
-    if (!complete) {
-      throw new AppError('OPERATION_FAILED', `${window.fromDate} 至 ${window.toDate} 的邮件超过 100 个虚拟滚动页，已拒绝返回可能不完整的结果。`);
+    if (searchQuery && sawRows && !sawParsedDate) {
+      throw new AppError('UI_CHANGED', 'Outlook 日期搜索返回了邮件，但无法解析任何邮件日期；已拒绝把结果误报为空。');
+    }
+    if (!scanComplete && flattenRowBuckets(matchingRows).length === 0) {
+      throw new AppError('OUTLOOK_NOT_READY', `${window.fromDate} 至 ${window.toDate} 的搜索尚未完成，当前未取得可验证结果。`);
     }
 
-    const allRows = Array.from(matchingRows.values());
+    const allRows = flattenRowBuckets(matchingRows);
     const selectedRows = allRows.slice(offset, offset + limit);
-    const hasMore = allRows.length > offset + limit;
-    const messages = selectedRows.map((row, index) => this.summaryForRow(row, String(offset + index + 1)));
+    const hasMore = allRows.length > offset + limit || !scanComplete;
+    const messages = this.summariesForRows(selectedRows, offset + 1);
     const source = window.date
       ? `date:${directory.path}:${window.date}`
       : `range:${directory.path}:${window.fromDate}:${window.toDate}`;
-    await this.writeListSession(source, messages, selectedRows);
+    await this.writeListSession(source, messages, selectedRows, {
+      query: searchQuery,
+      directory: directory.path,
+      complete: scanComplete,
+    });
     return {
       date: window.date,
       fromDate: window.fromDate,
@@ -564,6 +710,9 @@ export class OutlookService {
       directory,
       messages,
       hasMore,
+      complete: scanComplete,
+      searchQuery,
+      scope: 'selected-folder',
       nextCursor: hasMore ? encodeCursor(scope, offset + limit) : null,
       filters: { sender, subject, unread: Boolean(options.unread), hasAttachments: Boolean(options.hasAttachments) },
     };
@@ -610,7 +759,7 @@ export class OutlookService {
 
     return {
       id,
-      stableId: stableMessageId(locator),
+      stableId: locator.stableId ?? stableMessageId(locator),
       subject: result.message.subject,
       from: { name: result.message.fromName, address: result.message.fromAddress },
       to: result.message.to,
@@ -618,12 +767,22 @@ export class OutlookService {
       receivedAt: result.message.receivedAt,
       receivedAtText: result.message.receivedAtText,
       bodyText: result.message.bodyText,
+      bodyTruncated: Boolean(result.message.bodyTruncated),
+      bodyBytes: result.message.bodyBytes ?? Buffer.byteLength(result.message.bodyText, 'utf8'),
       attachments: result.message.attachments.map((attachment, index) => ({
         id: String(index + 1),
         filename: attachment.filename,
         sizeText: attachment.sizeText,
       })),
+      unreadRestored: await this.restoreUnreadAfterRead(id, locator),
     };
+  }
+
+  private async restoreUnreadAfterRead(id: string, locator: MessageLocator): Promise<boolean> {
+    if (locator.unread !== true) return false;
+    const result = await this.backend.setReadState(locator, true);
+    this.assertStatePerformed(id, result);
+    return true;
   }
 
   async attachments(id: string): Promise<{ attachments: AttachmentSummary[] }> {
@@ -651,8 +810,16 @@ export class OutlookService {
       throw new AppError('OPERATION_FAILED', `Outlook 操作失败：${result.status}。`);
     }
     if (!result.verified) {
-      throw new AppError('OPERATION_FAILED', 'Outlook 已接受操作，但无法验证最终页面状态。');
+      throw new AppError('OPERATION_UNKNOWN', 'Outlook 已接受操作，但无法验证最终页面状态；禁止自动重试。');
     }
+  }
+
+  private async recordMutationError(requestId: string, appError: AppError, action: string, mailId: string): Promise<void> {
+    if (['OPERATION_UNKNOWN', 'PLAYWRIGHT_TIMEOUT', 'TIMEOUT'].includes(appError.code)) {
+      await this.mutationStore.uncertain(requestId, appError.code, { action, mailId });
+      return;
+    }
+    await this.mutationStore.fail(requestId, appError.code, { action, mailId });
   }
 
   async delete(
@@ -671,7 +838,7 @@ export class OutlookService {
     );
     if (prior) return { ...prior, deduplicated: true };
     const locator = await this.sessionLocator(id);
-    const auditId = stableMessageId(locator);
+    const auditId = locator.stableId ?? stableMessageId(locator);
     await this.mutationStore.begin(normalizedRequestId, 'delete', payloadHash, auditId);
     try {
       await this.ensureReady();
@@ -679,7 +846,7 @@ export class OutlookService {
       this.assertPerformed(id, result);
     } catch (error) {
       const appError = error instanceof AppError ? error : new AppError('OPERATION_FAILED', '删除邮件失败。', { cause: error });
-      await this.mutationStore.fail(normalizedRequestId, appError.code, { action: 'delete', mailId: auditId });
+      await this.recordMutationError(normalizedRequestId, appError, 'delete', auditId);
       throw error;
     }
     const response = { id, deleted: true as const, verified: true as const, sessionInvalidated: true as const, requestId: normalizedRequestId, deduplicated: false };
@@ -705,7 +872,7 @@ export class OutlookService {
     );
     if (prior) return { ...prior, deduplicated: true };
     const locator = await this.sessionLocator(id);
-    const auditId = stableMessageId(locator);
+    const auditId = locator.stableId ?? stableMessageId(locator);
     await this.mutationStore.begin(normalizedRequestId, 'move', payloadHash, auditId);
     try {
       await this.ensureReady();
@@ -713,7 +880,7 @@ export class OutlookService {
       this.assertPerformed(id, result);
     } catch (error) {
       const appError = error instanceof AppError ? error : new AppError('OPERATION_FAILED', '移动邮件失败。', { cause: error });
-      await this.mutationStore.fail(normalizedRequestId, appError.code, { action: 'move', mailId: auditId });
+      await this.recordMutationError(normalizedRequestId, appError, 'move', auditId);
       throw error;
     }
     const response = { id, folder: normalizedFolder, moved: true as const, verified: true as const, sessionInvalidated: true as const, requestId: normalizedRequestId, deduplicated: false };
@@ -734,7 +901,7 @@ export class OutlookService {
     }
     if (!result.verified) {
       const handoff = result.handedOff ? '；当前回复窗口已交给用户手工检查' : '';
-      throw new AppError('OPERATION_FAILED', `Outlook 回复操作失败：${result.status}${handoff}。`);
+      throw new AppError(result.performed && !result.draft ? 'OPERATION_UNKNOWN' : 'OPERATION_FAILED', `Outlook 回复操作失败：${result.status}${handoff}。`);
     }
   }
 
@@ -744,7 +911,7 @@ export class OutlookService {
     }
     if (result.status === 'message_not_found') throw new AppError('MESSAGE_NOT_FOUND', `${operation}的原邮件或草稿不存在。`);
     if (!result.verified || !result.performed) {
-      throw new AppError('OPERATION_FAILED', `${operation}失败：${result.status}。`);
+      throw new AppError(result.performed && !result.draft ? 'OPERATION_UNKNOWN' : 'OPERATION_FAILED', `${operation}失败：${result.status}。`);
     }
   }
 
@@ -789,7 +956,7 @@ export class OutlookService {
     } catch (error) {
       if (normalizedRequestId) {
         const appError = error instanceof AppError ? error : new AppError('OPERATION_FAILED', '新建邮件失败。', { cause: error });
-        await this.mutationStore.fail(normalizedRequestId, appError.code, { action: 'compose-send', mailId: auditId });
+        await this.recordMutationError(normalizedRequestId, appError, 'compose-send', auditId);
       }
       throw error;
     }
@@ -826,7 +993,7 @@ export class OutlookService {
       if (prior) return { ...prior, deduplicated: true };
     }
     const locator = await this.sessionLocator(id);
-    const auditId = stableMessageId(locator);
+    const auditId = locator.stableId ?? stableMessageId(locator);
     if (normalizedRequestId && payloadHash) await this.mutationStore.begin(normalizedRequestId, 'forward-send', payloadHash, auditId);
     let result: ComposeActionResult;
     try {
@@ -836,7 +1003,7 @@ export class OutlookService {
     } catch (error) {
       if (normalizedRequestId) {
         const appError = error instanceof AppError ? error : new AppError('OPERATION_FAILED', '转发邮件失败。', { cause: error });
-        await this.mutationStore.fail(normalizedRequestId, appError.code, { action: 'forward-send', mailId: auditId });
+        await this.recordMutationError(normalizedRequestId, appError, 'forward-send', auditId);
       }
       throw error;
     }
@@ -870,7 +1037,7 @@ export class OutlookService {
       if (prior) return { ...prior, deduplicated: true };
     }
     const locator = await this.sessionLocator(id);
-    const auditId = stableMessageId(locator);
+    const auditId = locator.stableId ?? stableMessageId(locator);
     if (normalizedRequestId && payloadHash) {
       await this.mutationStore.begin(normalizedRequestId, 'reply-send', payloadHash, auditId);
     }
@@ -882,7 +1049,7 @@ export class OutlookService {
     } catch (error) {
       if (normalizedRequestId) {
         const appError = error instanceof AppError ? error : new AppError('OPERATION_FAILED', '发送回复失败。', { cause: error });
-        await this.mutationStore.fail(normalizedRequestId, appError.code, { action: 'reply-send', mailId: auditId });
+        await this.recordMutationError(normalizedRequestId, appError, 'reply-send', auditId);
       }
       throw error;
     }
@@ -938,7 +1105,7 @@ export class OutlookService {
     if (opened.matchCount > 1) throw new AppError('AMBIGUOUS_MESSAGE', `草稿 ID ${id} 对应多个候选。`);
     if (opened.matchCount !== 1 || !opened.draft) throw new AppError('MESSAGE_NOT_FOUND', `无法定位草稿 ID ${id}。`);
     return {
-      id, stableId: stableMessageId(locator),
+      id, stableId: locator.stableId ?? stableMessageId(locator),
       to: opened.draft.to, cc: opened.draft.cc, bcc: opened.draft.bcc,
       subject: opened.draft.subject, bodyText: opened.draft.bodyText,
       attachments: opened.draft.attachments.map((attachment, index) => ({ id: String(index + 1), ...attachment })),
@@ -978,7 +1145,7 @@ export class OutlookService {
     const prior = await this.mutationStore.prior<Awaited<ReturnType<OutlookService['sendDraft']>>>(normalizedRequestId, 'draft-send', payloadHash, id);
     if (prior) return { ...prior, deduplicated: true };
     const locator = await this.sessionLocator(id);
-    const auditId = stableMessageId(locator);
+    const auditId = locator.stableId ?? stableMessageId(locator);
     await this.mutationStore.begin(normalizedRequestId, 'draft-send', payloadHash, auditId);
     try {
       await this.ensureReady();
@@ -986,7 +1153,7 @@ export class OutlookService {
       this.assertComposePerformed(result, '发送草稿');
     } catch (error) {
       const appError = error instanceof AppError ? error : new AppError('OPERATION_FAILED', '发送草稿失败。', { cause: error });
-      await this.mutationStore.fail(normalizedRequestId, appError.code, { action: 'draft-send', mailId: auditId });
+      await this.recordMutationError(normalizedRequestId, appError, 'draft-send', auditId);
       throw error;
     }
     const response = { id, sent: true as const, verified: true as const, sessionInvalidated: true as const, requestId: normalizedRequestId, deduplicated: false };
@@ -1005,7 +1172,7 @@ export class OutlookService {
     const prior = await this.mutationStore.prior<Awaited<ReturnType<OutlookService['discardDraft']>>>(normalizedRequestId, 'draft-discard', payloadHash, id);
     if (prior) return { ...prior, deduplicated: true };
     const locator = await this.sessionLocator(id);
-    const auditId = stableMessageId(locator);
+    const auditId = locator.stableId ?? stableMessageId(locator);
     await this.mutationStore.begin(normalizedRequestId, 'draft-discard', payloadHash, auditId);
     try {
       await this.ensureReady();
@@ -1013,7 +1180,7 @@ export class OutlookService {
       this.assertPerformed(id, result);
     } catch (error) {
       const appError = error instanceof AppError ? error : new AppError('OPERATION_FAILED', '放弃草稿失败。', { cause: error });
-      await this.mutationStore.fail(normalizedRequestId, appError.code, { action: 'draft-discard', mailId: auditId });
+      await this.recordMutationError(normalizedRequestId, appError, 'draft-discard', auditId);
       throw error;
     }
     const response = { id, discarded: true as const, verified: true as const, sessionInvalidated: true as const, requestId: normalizedRequestId, deduplicated: false };
@@ -1072,7 +1239,7 @@ export class OutlookService {
     if (result.matchCount > 1) throw new AppError('AMBIGUOUS_MESSAGE', `邮件 ID ${id} 对应多个候选。`);
     if (result.matchCount !== 1 || result.messages.length === 0) throw new AppError('MESSAGE_NOT_FOUND', `无法读取邮件 ID ${id} 的会话。`);
     return {
-      id, stableId: stableMessageId(locator), subject: locator.subject, complete: result.complete,
+      id, stableId: locator.stableId ?? stableMessageId(locator), subject: locator.subject, complete: result.complete,
       messages: result.messages.map((message, index) => ({
         index: index + 1,
         subject: message.subject,
@@ -1080,6 +1247,8 @@ export class OutlookService {
         to: message.to, cc: message.cc,
         receivedAt: message.receivedAt, receivedAtText: message.receivedAtText,
         bodyText: message.bodyText,
+        bodyTruncated: Boolean(message.bodyTruncated),
+        bodyBytes: message.bodyBytes ?? Buffer.byteLength(message.bodyText, 'utf8'),
         attachments: message.attachments.map((attachment, attachmentIndex) => ({ id: String(attachmentIndex + 1), ...attachment })),
       })),
     };
@@ -1196,5 +1365,9 @@ export class OutlookService {
       }
     }
     throw new AppError('OPERATION_FAILED', '批量导出超过 100 页，已停止以避免无限循环。');
+  }
+
+  async syncObsidian(options: DatedMailListOptions, outputDirectory: string): Promise<ObsidianSyncResult> {
+    return await syncObsidian(this, options, outputDirectory);
   }
 }

@@ -1,4 +1,4 @@
-import type { BrowserStatus, InspectResult, LoginHandoffResult, MessageInspectResult } from '../types/inspect.js';
+import type { BrowserStatus, InspectResult, LoginHandoffResult, MailReadyProbe, MessageInspectResult } from '../types/inspect.js';
 import type {
   AttachmentDownloadResult,
   ComposeActionResult,
@@ -17,7 +17,9 @@ import type {
 } from '../types/mail.js';
 
 export interface BrowserBackend {
+  readonly name?: BrowserBackendName;
   status(): Promise<BrowserStatus>;
+  waitUntilMailReady(timeoutMs?: number): Promise<MailReadyProbe>;
   handoffForLogin(): Promise<LoginHandoffResult>;
   snapshot(): Promise<string>;
   eval<T>(script: string): Promise<T>;
@@ -50,4 +52,7 @@ export interface BrowserBackend {
   setFlagState(locator: MessageLocator, flagged: boolean): Promise<MessageStateActionResult>;
   setCategoryState(locator: MessageLocator, category: string, applied: boolean): Promise<MessageStateActionResult>;
   getConversation(locator: MessageLocator): Promise<ConversationOpenResult>;
+  close?(): Promise<void>;
 }
+
+export type BrowserBackendName = 'playwright' | 'ego-lite';

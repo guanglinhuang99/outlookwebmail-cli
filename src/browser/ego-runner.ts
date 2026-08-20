@@ -15,6 +15,11 @@ export interface EgoRunResult<T> {
   value: T;
 }
 
+export interface BrowserScriptRunner {
+  run<T>(body: string, timeoutMs?: number): Promise<EgoRunResult<T>>;
+  close?(): Promise<void>;
+}
+
 export interface EgoRunnerOptions {
   command?: string;
   args?: string[];
@@ -45,6 +50,9 @@ export function parseMarkedResult<T>(stdout: string): T {
 }
 
 function parseProcessResult<T>(stdout: string, stderr: string): T {
+  if (/agentDelegatedToUser|user[- ]owned|user is controlling|用户.*控制/i.test(`${stdout}\n${stderr}`)) {
+    throw new AppError('OUTLOOK_NOT_READY', 'Ego Lite 任务空间当前由用户控制。请把控制权交还给 Agent 后重试。');
+  }
   try {
     return parseMarkedResult<T>(stdout);
   } catch {
@@ -65,7 +73,7 @@ function stderrSuffix(stderr: string): string {
   return `：${value.slice(-1000)}`;
 }
 
-export class EgoRunner {
+export class EgoRunner implements BrowserScriptRunner {
   private readonly command: string;
   private readonly args: string[];
   private readonly maxOutputBytes: number;
@@ -130,7 +138,12 @@ export class EgoRunner {
         }
 
         if (exitCode !== 0) {
-          reject(new AppError('EGO_BROWSER_ERROR', `ego-browser 退出码为 ${exitCode}${stderrSuffix(stderr)}`));
+          const detail = `${stdout}\n${stderr}`;
+          if (/agentDelegatedToUser|user[- ]owned|user is controlling|用户.*控制/i.test(detail)) {
+            reject(new AppError('OUTLOOK_NOT_READY', 'Ego Lite 任务空间当前由用户控制。请在完成登录或检查后把控制权交还给 Agent，再重新执行命令。'));
+          } else {
+            reject(new AppError('EGO_BROWSER_ERROR', `ego-browser 退出码为 ${exitCode}${stderrSuffix(stderr)}`));
+          }
           return;
         }
 

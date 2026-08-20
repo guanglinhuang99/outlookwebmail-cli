@@ -10,7 +10,7 @@ const recordSchema = z.object({
   action: z.string(),
   payloadHash: z.string(),
   mailId: z.string().optional(),
-  status: z.enum(['pending', 'succeeded', 'failed']),
+  status: z.enum(['pending', 'succeeded', 'failed', 'unknown']),
   createdAt: z.string(),
   completedAt: z.string().optional(),
   result: z.unknown().optional(),
@@ -28,7 +28,7 @@ export interface MutationAuditEvent {
   requestId: string;
   action: string;
   mailId: string;
-  status: 'pending' | 'succeeded' | 'failed' | 'deduplicated';
+  status: 'pending' | 'succeeded' | 'failed' | 'unknown' | 'deduplicated';
   errorCode?: string;
 }
 
@@ -124,12 +124,13 @@ export class MutationStore {
       await this.audit({ requestId, action, mailId: record.mailId ?? mailId, status: 'deduplicated' });
       return record.result as T;
     }
-    throw new AppError(
-      'OPERATION_FAILED',
-      record.status === 'pending'
-        ? `请求 ${requestId} 状态未决；为避免重复操作，请先人工核查邮箱并使用新的 request-id。`
-        : `请求 ${requestId} 曾失败；为避免不确定重试，请核查邮箱并使用新的 request-id。`,
-    );
+    if (record.status === 'pending' || record.status === 'unknown') {
+      throw new AppError(
+        'OPERATION_UNKNOWN',
+        `请求 ${requestId} 状态未决；请保留该 request-id 并人工核查邮箱，禁止换用新 request-id 自动重试。`,
+      );
+    }
+    throw new AppError('OPERATION_FAILED', `请求 ${requestId} 曾明确失败；请核查邮箱后再决定是否创建新请求。`);
   }
 
   async begin(requestId: string, action: string, payloadHash: string, mailId: string): Promise<void> {
@@ -184,5 +185,20 @@ export class MutationStore {
     });
     if (!updated) return;
     await this.audit({ requestId, ...event, status: 'failed', errorCode });
+  }
+
+  async uncertain(requestId: string, errorCode: string, event: Omit<MutationAuditEvent, 'requestId' | 'status' | 'errorCode'>): Promise<void> {
+    const updated = await this.withFileLock(async () => {
+      const file = await this.read();
+      const record = file.records[requestId];
+      if (!record) return false;
+      record.status = 'unknown';
+      record.completedAt = new Date().toISOString();
+      record.errorCode = errorCode;
+      await this.write(file);
+      return true;
+    });
+    if (!updated) return;
+    await this.audit({ requestId, ...event, status: 'unknown', errorCode });
   }
 }

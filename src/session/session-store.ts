@@ -6,6 +6,8 @@ import { z } from 'zod';
 import { AppError } from '../util/errors.js';
 
 const sessionMessageSchema = z.object({
+  stableHint: z.string().nullable().optional(),
+  stableId: z.string().optional(),
   subject: z.string(),
   senderName: z.string().nullable(),
   senderAddress: z.string().nullable(),
@@ -13,12 +15,16 @@ const sessionMessageSchema = z.object({
   receivedAtText: z.string().nullable(),
   preview: z.string().nullable(),
   hasAttachments: z.boolean().nullable().default(null),
+  unread: z.boolean().nullable().optional(),
 });
 
 const sessionSchema = z.object({
   version: z.literal(1),
   updatedAt: z.string(),
   source: z.string(),
+  query: z.string().nullable().optional(),
+  directory: z.string().nullable().optional(),
+  complete: z.boolean().optional(),
   messages: z.record(z.string(), sessionMessageSchema),
   stableMessages: z.record(z.string(), sessionMessageSchema).optional(),
 });
