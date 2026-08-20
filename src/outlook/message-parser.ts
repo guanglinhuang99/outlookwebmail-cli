@@ -12,6 +12,8 @@ const rawMessageSchema = z.object({
   receivedAt: z.string().nullable(),
   receivedAtText: z.string().nullable(),
   bodyText: z.string(),
+  bodyTruncated: z.boolean().optional(),
+  bodyBytes: z.number().int().nonnegative().optional(),
   attachments: z.array(z.object({ filename: z.string(), sizeText: z.string().nullable() })),
 });
 
@@ -52,6 +54,8 @@ export function buildMessageRowMatchScript(locator: MessageLocator): string {
     const rect = row.getBoundingClientRect();
     const parsedRow = {
       key: row.id || row.getAttribute('aria-label') || [sender && sender.getAttribute('title'), subject && subject.textContent, time && time.textContent].join('|'),
+      stableHint: [row.getAttribute('data-item-id'), row.getAttribute('data-message-id'), row.getAttribute('data-convid'), row.getAttribute('data-conversation-id')]
+        .map(clean).find(Boolean) || null,
       senderName: clean(sender ? sender.textContent : avatar && avatar.getAttribute('aria-label')),
       senderAddress: clean(sender && sender.getAttribute('title')),
       subject: clean(subject && subject.textContent),
@@ -74,6 +78,7 @@ export function buildMessageRowMatchScript(locator: MessageLocator): string {
   });
   const matches = parsed.filter(row =>
     row.inViewport &&
+    (!target.stableHint || row.stableHint === clean(target.stableHint)) &&
     row.subject === clean(target.subject) &&
     (!target.senderAddress && !target.senderName
       ? true
@@ -139,7 +144,8 @@ export function buildMessageExtractScript(locator: MessageLocator): string {
 
   function truncateUtf8(value, maximumBytes) {
     const encoder = new TextEncoder();
-    if (encoder.encode(value).length <= maximumBytes) return value;
+    const encoded = encoder.encode(value);
+    if (encoded.length <= maximumBytes) return { text: value, truncated: false, bytes: encoded.length };
     let output = '';
     let bytes = 0;
     for (const character of value) {
@@ -148,20 +154,23 @@ export function buildMessageExtractScript(locator: MessageLocator): string {
       output += character;
       bytes += size;
     }
-    return output;
+    return { text: output, truncated: true, bytes: encoded.length };
   }
 
   const body = documentElement
     ? (documentElement.innerText || '').replace(/\r\n?/g, '\n').replace(/\u00a0/g, ' ').replace(/[ \t]+\n/g, '\n').replace(/\n{3,}/g, '\n\n').trim()
     : '';
+  const bodyResult = truncateUtf8(body, 100 * 1024);
   const attachmentRoots = Array.from(pane.querySelectorAll('[role="listbox"]'))
     .filter(el => /文件附件|attachments?/i.test(el.getAttribute('aria-label') || ''));
   const attachments = attachmentRoots.flatMap(root => Array.from(root.querySelectorAll('[role="option"]')).map(option => {
-    const filenameElement = Array.from(option.querySelectorAll('[title]')).find(el => {
-      const title = clean(el.getAttribute('title'));
-      return title && /\.[a-z0-9]{2,8}$/i.test(title);
-    });
-    const filename = clean(filenameElement && filenameElement.getAttribute('title'));
+    const titleCandidates = Array.from(option.querySelectorAll('[title]')).map(el => clean(el.getAttribute('title')))
+      .filter(title => title && !/^(更多操作|more actions|下载|download|预览|preview|打开|open)$/i.test(title)
+        && !/^\d+(?:\.\d+)?\s*(?:bytes?|[kmgt]b|字节)$/i.test(title));
+    const textCandidates = (option.innerText || '').split(/\r?\n/).map(clean)
+      .filter(text => text && !/^(更多操作|more actions|下载|download|预览|preview|打开|open)$/i.test(text)
+        && !/^\d+(?:\.\d+)?\s*(?:bytes?|[kmgt]b|字节)$/i.test(text));
+    const filename = titleCandidates[0] || textCandidates[0] || '';
     const sizeMatch = clean(option.innerText).match(/\b\d+(?:\.\d+)?\s*(?:bytes?|[kmgt]b|字节)\b/i);
     return { filename, sizeText: sizeMatch ? sizeMatch[0] : null };
   })).filter(item => item.filename);
@@ -175,7 +184,9 @@ export function buildMessageExtractScript(locator: MessageLocator): string {
     cc: recipients(ccHeading),
     receivedAt: toIso(receivedAtText || ''),
     receivedAtText,
-    bodyText: truncateUtf8(body, 100 * 1024),
+    bodyText: bodyResult.text,
+    bodyTruncated: bodyResult.truncated,
+    bodyBytes: bodyResult.bytes,
     attachments
   };
 })()

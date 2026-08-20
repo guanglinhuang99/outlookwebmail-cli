@@ -1,6 +1,6 @@
 #!/usr/bin/env node
 
-import { Command, CommanderError, InvalidArgumentError } from 'commander';
+import { Command, CommanderError, InvalidArgumentError, Option } from 'commander';
 import { createBrowserBackend } from './browser/browser-factory.js';
 import { OutlookService } from './outlook/service.js';
 import { AppError, toAppError } from './util/errors.js';
@@ -9,6 +9,13 @@ import { watchMail } from './watch/mail-watcher.js';
 
 function requestedJson(argv: string[]): boolean {
   return argv.includes('--json');
+}
+
+function requestedMode(argv: string[]): string | undefined {
+  const equals = argv.find(argument => argument.startsWith('--mode='));
+  if (equals) return equals.slice('--mode='.length);
+  const index = argv.indexOf('--mode');
+  return index >= 0 ? argv[index + 1] : undefined;
 }
 
 function parseLimit(value: string): number {
@@ -69,6 +76,9 @@ export function createProgram(service = new OutlookService(createBrowserBackend(
     .name('webmail')
     .description('Outlook Web CLI through Playwright (Ego Lite fallback)')
     .version('0.3.0')
+    .addOption(new Option('--mode <mode>', '运行模式；default 保持当前配置，egolite 全程使用 Ego Lite')
+      .choices(['default', 'egolite'])
+      .default('default'))
     .showHelpAfterError()
     .exitOverride();
 
@@ -488,6 +498,7 @@ export function createProgram(service = new OutlookService(createBrowserBackend(
           iterations: options.iterations,
           signal: controller.signal,
           onEvent: event => { process.stdout.write(`${JSON.stringify(event)}\n`); },
+          onStatus: event => { process.stdout.write(`${JSON.stringify(event)}\n`); },
         });
       } finally {
         process.removeListener('SIGINT', stop);
@@ -522,8 +533,11 @@ export function createProgram(service = new OutlookService(createBrowserBackend(
 }
 
 export async function main(argv = process.argv): Promise<void> {
-  const service = new OutlookService(createBrowserBackend());
+  let service: OutlookService | null = null;
   try {
+    const mode = requestedMode(argv);
+    const env = mode ? { ...process.env, WEBMAIL_MODE: mode } : process.env;
+    service = new OutlookService(createBrowserBackend({ env }));
     await createProgram(service).parseAsync(argv);
   } catch (error) {
     if (error instanceof CommanderError) {
@@ -533,9 +547,12 @@ export async function main(argv = process.argv): Promise<void> {
       if (requestedJson(argv)) writeJson(errorResult(appError));
       return;
     }
-    throw error;
+    const appError = toAppError(error);
+    process.exitCode = appError.exitCode;
+    if (requestedJson(argv)) writeJson(errorResult(appError));
+    else process.stderr.write(`[${appError.code}] ${appError.message}\n`);
   } finally {
-    await service.close().catch(() => undefined);
+    await service?.close().catch(() => undefined);
   }
 }
 

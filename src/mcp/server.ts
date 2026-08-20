@@ -2,7 +2,17 @@ import { McpServer } from '@modelcontextprotocol/server';
 import type { OutlookService } from '../outlook/service.js';
 import { createWebmailTools, invokeWebmailTool } from './tools.js';
 
+export function createSerialExecutor(): <T>(operation: () => Promise<T>) => Promise<T> {
+  let tail = Promise.resolve();
+  return async <T>(operation: () => Promise<T>): Promise<T> => {
+    const current = tail.then(operation, operation);
+    tail = current.then(() => undefined, () => undefined);
+    return await current;
+  };
+}
+
 export function createWebmailMcpServer(service: OutlookService): McpServer {
+  const serial = createSerialExecutor();
   const server = new McpServer(
     { name: 'outlook-webmail', version: '0.3.0' },
     {
@@ -22,7 +32,7 @@ export function createWebmailMcpServer(service: OutlookService): McpServer {
           idempotentHint: Boolean(definition.destructive),
         },
       },
-      async args => await invokeWebmailTool(definition, args as Record<string, unknown>),
+      async args => await serial(async () => await invokeWebmailTool(definition, args as Record<string, unknown>)),
     );
   }
   return server;

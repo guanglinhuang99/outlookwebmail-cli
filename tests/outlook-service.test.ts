@@ -19,7 +19,8 @@ afterEach(async () => {
 });
 
 function createBackend(searchValue = ''): BrowserBackend {
-  return {
+  let currentSearch = searchValue;
+  const backend = {
     status: vi.fn().mockResolvedValue({
       connected: true,
       taskSpaceId: 1,
@@ -33,10 +34,16 @@ function createBackend(searchValue = ''): BrowserBackend {
       url: 'https://partner.outlook.cn/mail/',
       handedOff: true,
     }),
-    eval: vi.fn().mockResolvedValue({ count: 1, value: searchValue }),
-    clickAndWait: vi.fn().mockResolvedValue(undefined),
+    waitUntilMailReady: vi.fn().mockResolvedValue({
+      ready: true, url: 'https://partner.outlook.cn/mail/', title: 'Outlook',
+      searchInputs: 1, inboxFolders: 1, mailLists: 1, loginFrames: 0, busy: false,
+    }),
+    eval: vi.fn().mockImplementation(async (script: string) => script.includes('firstKey')
+      ? { count: 1, value: currentSearch, listCount: 1, firstKey: 'row-1', busy: false, empty: false }
+      : { count: 1, value: currentSearch }),
+    clickAndWait: vi.fn().mockImplementation(async () => { currentSearch = ''; }),
     fill: vi.fn().mockResolvedValue(undefined),
-    fillAndPress: vi.fn().mockResolvedValue(undefined),
+    fillAndPress: vi.fn().mockImplementation(async (_selector: string, value: string) => { currentSearch = value; }),
     press: vi.fn().mockResolvedValue(undefined),
     wheel: vi.fn().mockResolvedValue(undefined),
     wait: vi.fn().mockResolvedValue(undefined),
@@ -116,6 +123,7 @@ function createBackend(searchValue = ''): BrowserBackend {
       attachmentCount: 1, attachmentId: '1', filename: 'report.xlsx', path: '/tmp/report.xlsx', bytes: 12,
     }),
   } as unknown as BrowserBackend;
+  return backend;
 }
 
 function createParser(rows: RawMessageRow[]): InboxParser {
@@ -171,8 +179,31 @@ describe('OutlookService mail listing', () => {
   it('returns status without handing off when Outlook is already signed in', async () => {
     const { service, backend } = await createService();
 
-    await expect(service.status()).resolves.toMatchObject({ state: 'INBOX' });
+    await expect(service.status()).resolves.toMatchObject({ state: 'INBOX', mailReady: true });
     expect(backend.handoffForLogin).not.toHaveBeenCalled();
+  });
+
+  it('does not report an authenticated shell as mail-ready', async () => {
+    const { service, backend } = await createService();
+    vi.mocked(backend.waitUntilMailReady).mockResolvedValueOnce({
+      ready: false, url: 'https://partner.outlook.cn/mail/', title: 'Outlook',
+      searchInputs: 0, inboxFolders: 0, mailLists: 0, loginFrames: 1, busy: true,
+    });
+
+    await expect(service.status()).rejects.toMatchObject({
+      code: 'OUTLOOK_NOT_READY',
+      message: expect.stringContaining('登录 iframe=1'),
+    });
+  });
+
+  it('turns a redirect to the login host during readiness waiting into AUTH_REQUIRED', async () => {
+    const { service, backend } = await createService();
+    vi.mocked(backend.waitUntilMailReady).mockResolvedValueOnce({
+      ready: false, url: 'https://login.partner.microsoftonline.cn/authorize?login_hint=secret', title: 'Sign in',
+      searchInputs: 0, inboxFolders: 0, mailLists: 0, loginFrames: 0, busy: false,
+    });
+    await expect(service.status()).rejects.toMatchObject({ code: 'AUTH_REQUIRED' });
+    expect(backend.handoffForLogin).toHaveBeenCalledOnce();
   });
 
   it('opens and hands off Outlook when authentication is required', async () => {
@@ -220,8 +251,24 @@ describe('OutlookService mail listing', () => {
 
     expect(result.messages).toHaveLength(2);
     expect(result.date).toBe('2026-08-20');
+    expect(result).toMatchObject({ searchQuery: 'received:2026-08-20', scope: 'selected-folder' });
     expect(result.directory).toMatchObject({ path: '收件箱' });
     await expect(store.read()).resolves.toMatchObject({ source: 'date:收件箱:2026-08-20' });
+  });
+
+  it('preserves visually identical rows and assigns collision-safe stable IDs', async () => {
+    const { service, parser } = await createService();
+    const duplicate: RawMessageRow = {
+      stableHint: null, senderName: '机器人', senderAddress: 'robot@example.com', subject: '重复告警',
+      receivedAt: '2026-08-20T09:00:00+08:00', receivedAtText: '9:00', preview: '相同内容',
+      unread: true, hasAttachments: false,
+    };
+    vi.mocked(parser.resetAndExtract).mockResolvedValueOnce([duplicate, { ...duplicate }]);
+    vi.mocked(parser.scrollAndExtract).mockResolvedValue([duplicate, { ...duplicate }]);
+
+    const result = await service.listByDate({ date: '2026-08-20', limit: 10 });
+    expect(result.messages).toHaveLength(2);
+    expect(new Set(result.messages.map(message => message.stableId))).toHaveProperty('size', 2);
   });
 
   it('lists today messages from an explicitly selected Inbox child directory', async () => {
@@ -365,7 +412,7 @@ describe('OutlookService mail listing', () => {
     const { service, backend, store } = await createService();
     await service.search('  风险报告  ', { limit: 1 });
 
-    expect(backend.fillAndPress).toHaveBeenCalledWith(expect.stringContaining('combobox'), '风险报告', 'Enter', 1_500);
+    expect(backend.fillAndPress).toHaveBeenCalledWith(expect.stringContaining('combobox'), '风险报告', 'Enter', 0);
     await expect(store.read()).resolves.toMatchObject({ source: 'search:风险报告' });
   });
 
@@ -376,7 +423,7 @@ describe('OutlookService mail listing', () => {
       .mockResolvedValueOnce({ count: 1, value: '' });
 
     await service.inbox({ limit: 1 });
-    expect(backend.clickAndWait).toHaveBeenCalledWith(expect.stringContaining('退出搜索'), 1_000);
+    expect(backend.clickAndWait).toHaveBeenCalledWith(expect.stringContaining('退出搜索'), 0);
   });
 
   it('reads one unique session message and numbers its attachments', async () => {
@@ -409,6 +456,33 @@ describe('OutlookService mail listing', () => {
     await expect(service.read('1')).resolves.toMatchObject({
       id: '1', subject: '测试主题', attachments: [{ id: '1', filename: 'report.xlsx', sizeText: '12 KB' }],
     });
+  });
+
+  it('restores unread state after reading an unread session message', async () => {
+    const { backend, parser, store } = await createService();
+    await store.write({
+      version: 1, updatedAt: '2026-08-20T01:00:00.000Z', source: 'search:report',
+      messages: {
+        '1': {
+          stableHint: 'item-1', subject: '未读报告', senderName: '张三', senderAddress: 'zhangsan@example.com',
+          receivedAt: '2026-08-20T09:30:00+08:00', receivedAtText: '9:30', preview: '预览',
+          hasAttachments: false, unread: true,
+        },
+      },
+    });
+    const messageParser: MessageParser = {
+      openAndExtract: vi.fn().mockResolvedValue({
+        matchCount: 1,
+        message: {
+          subject: '未读报告', fromName: '张三', fromAddress: 'zhangsan@example.com', to: [], cc: [],
+          receivedAt: '2026-08-20T09:30:00+08:00', receivedAtText: '9:30', bodyText: '正文', attachments: [],
+        },
+      }),
+    };
+    const service = new OutlookService(backend, store, parser, messageParser);
+
+    await expect(service.read('1')).resolves.toMatchObject({ unreadRestored: true });
+    expect(backend.setReadState).toHaveBeenCalledWith(expect.objectContaining({ stableHint: 'item-1', unread: true }), true);
   });
 
   it('keeps stable IDs resolvable across list refreshes', async () => {
@@ -587,6 +661,29 @@ describe('OutlookService mail listing', () => {
       requestId: 'reply-test-001', deduplicated: false,
     });
     expect(backend.replyMessage).toHaveBeenCalledWith(expect.any(Object), '请大家查收。', false, true);
+  });
+
+  it('records an unverified automatic send as unknown and blocks retries', async () => {
+    const { service, backend, store } = await createService();
+    await store.write({
+      version: 1, updatedAt: '2026-08-20T01:00:00.000Z', source: 'inbox',
+      messages: {
+        '1': {
+          subject: '测试主题', senderName: '张三', senderAddress: 'zhangsan@example.com',
+          receivedAt: null, receivedAtText: null, preview: null, hasAttachments: false,
+        },
+      },
+    });
+    vi.mocked(backend.replyMessage).mockResolvedValueOnce({
+      matchCount: 1, status: 'send_not_verified', performed: true, verified: false,
+      draft: false, replyAll: false, handedOff: false,
+    });
+
+    await expect(service.reply('1', '自动发送', false, false, 'reply-unknown-001'))
+      .rejects.toMatchObject({ code: 'OPERATION_UNKNOWN' });
+    await expect(service.reply('1', '自动发送', false, false, 'reply-unknown-001'))
+      .rejects.toMatchObject({ code: 'OPERATION_UNKNOWN' });
+    expect(backend.replyMessage).toHaveBeenCalledOnce();
   });
 
   it('deduplicates automatic replies by request ID', async () => {

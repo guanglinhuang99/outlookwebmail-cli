@@ -1,7 +1,7 @@
 import { mkdtemp, readFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { describe, expect, it } from 'vitest';
+import { afterEach, describe, expect, it, vi } from 'vitest';
 import type { DatedMailListResult } from '../src/outlook/service.js';
 import type { MailSummary } from '../src/types/mail.js';
 import { watchMail } from '../src/watch/mail-watcher.js';
@@ -25,6 +25,8 @@ function result(messages: MailSummary[]): DatedMailListResult {
 }
 
 describe('watchMail', () => {
+  afterEach(() => { vi.useRealTimers(); });
+
   it('首次建立基线，后续只输出新增邮件并持久化状态', async () => {
     const root = await mkdtemp(join(tmpdir(), 'webmail-watch-'));
     const statePath = join(root, 'watch.json');
@@ -56,5 +58,34 @@ describe('watchMail', () => {
       onEvent: event => { events.push(event); },
     });
     expect(events).toHaveLength(1);
+  });
+
+  it('默认定时器会保持进程活跃并完成后续轮询', async () => {
+    vi.useFakeTimers({ toFake: ['setTimeout', 'clearTimeout'] });
+    const root = await mkdtemp(join(tmpdir(), 'webmail-watch-timer-'));
+    const operation = watchMail({ listByDate: async () => result([]) }, {
+      iterations: 2, intervalSeconds: 5, statePath: join(root, 'watch.json'), onEvent: () => undefined,
+    });
+    while (vi.getTimerCount() === 0) await new Promise(resolve => setImmediate(resolve));
+    await vi.advanceTimersByTimeAsync(5_000);
+    await expect(operation).resolves.toMatchObject({ polls: 2 });
+  });
+
+  it('transient errors use backoff and emit recovery status', async () => {
+    const root = await mkdtemp(join(tmpdir(), 'webmail-watch-retry-'));
+    let attempts = 0;
+    const statuses: unknown[] = [];
+    const operation = await watchMail({
+      listByDate: async () => {
+        attempts += 1;
+        if (attempts === 1) throw new Error('temporary failure');
+        return result([]);
+      },
+    }, {
+      iterations: 1, intervalSeconds: 5, statePath: join(root, 'watch.json'),
+      sleep: async () => undefined, onEvent: () => undefined, onStatus: event => { statuses.push(event); },
+    });
+    expect(operation.polls).toBe(1);
+    expect(statuses).toMatchObject([{ type: 'watch.error' }, { type: 'watch.recovered' }]);
   });
 });

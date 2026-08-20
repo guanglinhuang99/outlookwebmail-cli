@@ -25,6 +25,14 @@ export interface NewMessageEvent {
   message: MailSummary;
 }
 
+export interface WatchStatusEvent {
+  type: 'watch.error' | 'watch.recovered';
+  observedAt: string;
+  consecutiveErrors: number;
+  code?: string;
+  message?: string;
+}
+
 export interface MailWatchOptions {
   directory?: string | null;
   intervalSeconds?: number;
@@ -35,6 +43,8 @@ export interface MailWatchOptions {
   now?: () => Date;
   sleep?: (milliseconds: number, signal?: AbortSignal) => Promise<void>;
   onEvent: (event: NewMessageEvent) => void | Promise<void>;
+  onStatus?: (event: WatchStatusEvent) => void | Promise<void>;
+  maxConsecutiveErrors?: number;
 }
 
 export interface MailWatchResult {
@@ -86,7 +96,6 @@ function defaultSleep(milliseconds: number, signal?: AbortSignal): Promise<void>
   if (signal?.aborted) return Promise.resolve();
   return new Promise(resolvePromise => {
     const timer = setTimeout(resolvePromise, milliseconds);
-    timer.unref?.();
     signal?.addEventListener('abort', () => {
       clearTimeout(timer);
       resolvePromise();
@@ -109,9 +118,38 @@ export async function watchMail(source: MailWatchSource, options: MailWatchOptio
   const sleep = options.sleep ?? defaultSleep;
   let polls = 0;
   let emitted = 0;
+  let consecutiveErrors = 0;
+  const maxConsecutiveErrors = options.maxConsecutiveErrors ?? 10;
+  if (!Number.isInteger(maxConsecutiveErrors) || maxConsecutiveErrors < 1 || maxConsecutiveErrors > 100) {
+    throw new AppError('INVALID_ARGUMENT', 'maxConsecutiveErrors 必须是 1 到 100 之间的整数。');
+  }
 
   while (!options.signal?.aborted && (iterations === 0 || polls < iterations)) {
-    const result = await collectToday(source, options.directory);
+    let result: DatedMailListResult;
+    try {
+      result = await collectToday(source, options.directory);
+      if (consecutiveErrors > 0) {
+        await options.onStatus?.({
+          type: 'watch.recovered', observedAt: now().toISOString(), consecutiveErrors,
+        });
+        consecutiveErrors = 0;
+      }
+    } catch (error) {
+      consecutiveErrors += 1;
+      const appError = error instanceof AppError
+        ? error
+        : new AppError('OPERATION_FAILED', error instanceof Error ? error.message : 'watch 轮询失败。', { cause: error });
+      await options.onStatus?.({
+        type: 'watch.error', observedAt: now().toISOString(), consecutiveErrors,
+        code: appError.code, message: appError.message,
+      });
+      if (consecutiveErrors >= maxConsecutiveErrors || ['AUTH_REQUIRED', 'INVALID_ARGUMENT'].includes(appError.code)) {
+        throw appError;
+      }
+      const backoffMs = Math.min(intervalSeconds * 1_000 * (2 ** (consecutiveErrors - 1)), 300_000);
+      await sleep(backoffMs, options.signal);
+      continue;
+    }
     polls += 1;
     const date = result.date ?? result.fromDate;
     const directory = result.directory?.path ?? (options.directory?.trim() || '收件箱');

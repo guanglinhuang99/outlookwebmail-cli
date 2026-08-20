@@ -10,6 +10,10 @@ import {
   type BrowserExecutable,
   type PlaywrightConfig,
 } from './playwright-config.js';
+import { clearManagedCdpEndpoint, launchManagedBrowser, readManagedCdpEndpoint } from './managed-cdp.js';
+import { discoverSharedEdgeEndpoint } from './shared-edge.js';
+
+type BrowserSession = 'launched' | 'reused' | 'external-cdp' | 'shared-edge';
 
 type ScriptFunction = (...args: unknown[]) => Promise<void>;
 type AsyncFunctionConstructor = new (...args: string[]) => ScriptFunction;
@@ -25,12 +29,17 @@ export class PlaywrightRunner implements BrowserScriptRunner {
   private launchPromise: Promise<void> | null = null;
   private lastDialog: { type: string; message: string } | null = null;
   private browserExecutable: BrowserExecutable | null = null;
+  private browserSession: BrowserSession | null = null;
   private readonly observedPages = new WeakSet<Page>();
 
   constructor(readonly config: PlaywrightConfig = loadPlaywrightConfig()) {}
 
   get executable(): BrowserExecutable | null {
     return this.browserExecutable;
+  }
+
+  get session(): BrowserSession | null {
+    return this.browserSession;
   }
 
   private mapError(error: unknown): AppError {
@@ -51,29 +60,61 @@ export class PlaywrightRunner implements BrowserScriptRunner {
     return new AppError('PLAYWRIGHT_ERROR', `Playwright 操作失败：${message.slice(0, 1000)}`, { cause: error as Error });
   }
 
+  private async connect(endpoint: string): Promise<void> {
+    this.browser = await chromium.connectOverCDP(endpoint, { timeout: this.config.timeoutMs });
+    const contexts = this.browser.contexts();
+    this.context = contexts.find(context => context.pages().some(page => this.isOutlookUrl(page.url())))
+      ?? contexts[0]
+      ?? null;
+    if (!this.context) throw new AppError('PLAYWRIGHT_ERROR', `CDP 未返回可用浏览器上下文：${redactCdpEndpoint(endpoint)}`);
+  }
+
   private async launch(): Promise<void> {
     try {
-      if (this.config.cdpEndpoint) {
-        this.browser = await chromium.connectOverCDP(this.config.cdpEndpoint, { timeout: this.config.timeoutMs });
-        this.context = this.browser.contexts()[0] ?? null;
-        if (!this.context) throw new AppError('PLAYWRIGHT_ERROR', `CDP 未返回可用浏览器上下文：${redactCdpEndpoint(this.config.cdpEndpoint)}`);
+      if (this.config.shareEdge) {
+        const endpoint = await discoverSharedEdgeEndpoint();
+        try {
+          await this.connect(endpoint);
+        } catch (error) {
+          throw new AppError(
+            'SHARED_EDGE_NOT_AVAILABLE',
+            `无法连接日常 Edge 的远程调试端点 ${redactCdpEndpoint(endpoint)}。请确认 Edge 仍在运行且 edge://inspect 中的远程调试仍已启用。`,
+            { cause: error },
+          );
+        }
+        this.browserSession = 'shared-edge';
+      } else if (this.config.cdpEndpoint) {
+        await this.connect(this.config.cdpEndpoint);
+        this.browserSession = 'external-cdp';
       } else {
         this.browserExecutable = await resolveBrowserExecutable(this.config);
         await prepareProfileDirectory(this.config);
-        this.context = await chromium.launchPersistentContext(this.config.profileDir, {
-          executablePath: this.browserExecutable.path,
-          headless: this.config.headless,
-          acceptDownloads: true,
-          timeout: this.config.timeoutMs,
-        });
+        const existingEndpoint = await readManagedCdpEndpoint(this.config.profileDir);
+        if (existingEndpoint) {
+          try {
+            await this.connect(existingEndpoint);
+            this.browserSession = 'reused';
+          } catch {
+            this.browser = null;
+            this.context = null;
+            await clearManagedCdpEndpoint(this.config.profileDir);
+          }
+        }
+        if (!this.context) {
+          const endpoint = await launchManagedBrowser(this.browserExecutable.path, this.config);
+          await this.connect(endpoint);
+          this.browserSession = 'launched';
+        }
       }
-      this.context.setDefaultTimeout(this.config.timeoutMs);
-      this.context.setDefaultNavigationTimeout(this.config.timeoutMs);
-      this.page = this.context.pages().find(page => this.isOutlookUrl(page.url()))
-        ?? this.context.pages()[0]
-        ?? await this.context.newPage();
+      const context = this.context;
+      if (!context) throw new AppError('PLAYWRIGHT_ERROR', 'CDP 未返回可用浏览器上下文。');
+      context.setDefaultTimeout(this.config.timeoutMs);
+      context.setDefaultNavigationTimeout(this.config.timeoutMs);
+      this.page = context.pages().find(page => this.isOutlookUrl(page.url()))
+        ?? await context.newPage();
       this.observePage(this.page);
-      this.context.on('page', page => this.observePage(page));
+      context.on('page', page => this.observePage(page));
+      await this.openOrReuseTab(this.config.outlookUrl);
     } catch (error) {
       await this.close().catch(() => undefined);
       throw this.mapError(error);
@@ -120,19 +161,71 @@ export class PlaywrightRunner implements BrowserScriptRunner {
     const context = this.context;
     if (!context) throw new AppError('PLAYWRIGHT_ERROR', 'Playwright 浏览器上下文不可用。');
     const existing = context.pages().find(page => this.isOutlookUrl(page.url()) && !page.isClosed());
-    const nextPage = existing ?? (this.page && !this.page.isClosed() ? this.page : await context.newPage());
+    const nextPage = existing ?? await context.newPage();
     if (this.page !== nextPage) this.cdpSession = null;
     this.page = nextPage;
     this.observePage(this.page);
     if (!this.isOutlookUrl(this.page.url())) {
       await this.page.goto(url.href, { waitUntil: 'domcontentloaded', timeout: this.config.timeoutMs });
+    } else {
+      await this.page.waitForLoadState('domcontentloaded', { timeout: this.config.timeoutMs }).catch(() => undefined);
     }
     await this.page.bringToFront();
     return this.page;
   }
 
   private async evaluate<T>(expression: string): Promise<T> {
-    return await this.currentPage().evaluate(expression) as T;
+    let lastError: unknown;
+    for (let attempt = 0; attempt < 6; attempt += 1) {
+      try {
+        return await this.currentPage().evaluate(expression) as T;
+      } catch (error) {
+        lastError = error;
+        if (!/execution context was destroyed|navigation|cannot find context/i.test(error instanceof Error ? error.message : String(error))) throw error;
+        await this.currentPage().waitForTimeout(250);
+      }
+    }
+    throw lastError;
+  }
+
+  private async pageInformation(): Promise<Record<string, unknown>> {
+    let lastError: unknown;
+    for (let attempt = 0; attempt < 6; attempt += 1) {
+      const page = this.currentPage();
+      try {
+        const metrics = await page.evaluate(() => ({
+          w: innerWidth,
+          h: innerHeight,
+          sx: scrollX,
+          sy: scrollY,
+          pw: document.documentElement.scrollWidth,
+          ph: document.documentElement.scrollHeight,
+        }));
+        const title = await page.title();
+        const dialog = this.lastDialog;
+        this.lastDialog = null;
+        return { url: page.url(), title, ...metrics, dialog };
+      } catch (error) {
+        lastError = error;
+        if (!/execution context was destroyed|navigation|cannot find context/i.test(error instanceof Error ? error.message : String(error))) throw error;
+        await page.waitForTimeout(250);
+      }
+    }
+    throw lastError;
+  }
+
+  private async snapshotText(): Promise<string> {
+    let lastError: unknown;
+    for (let attempt = 0; attempt < 6; attempt += 1) {
+      try {
+        return await this.currentPage().locator('body').innerText();
+      } catch (error) {
+        lastError = error;
+        if (!/execution context was destroyed|navigation|cannot find context/i.test(error instanceof Error ? error.message : String(error))) throw error;
+        await this.currentPage().waitForTimeout(250);
+      }
+    }
+    throw lastError;
   }
 
   private async click(target: ClickTarget): Promise<void> {
@@ -176,22 +269,20 @@ export class PlaywrightRunner implements BrowserScriptRunner {
     return {
       useOrCreateTaskSpace: async (_name: string) => ({ id: 'playwright' }),
       openOrReuseTab: async (url: string) => await this.openOrReuseTab(url),
-      ensureRealTab: async () => this.page && !this.page.isClosed() ? this.page : null,
-      pageInfo: async () => {
-        const page = this.currentPage();
-        const metrics = await page.evaluate(() => ({
-          w: innerWidth,
-          h: innerHeight,
-          sx: scrollX,
-          sy: scrollY,
-          pw: document.documentElement.scrollWidth,
-          ph: document.documentElement.scrollHeight,
-        }));
-        const dialog = this.lastDialog;
-        this.lastDialog = null;
-        return { url: page.url(), title: await page.title(), ...metrics, dialog };
+      ensureRealTab: async () => {
+        const context = this.context;
+        const outlookPage = context?.pages().find(page => this.isOutlookUrl(page.url()) && !page.isClosed()) ?? null;
+        if (outlookPage) {
+          this.page = outlookPage;
+          this.observePage(outlookPage);
+          await outlookPage.bringToFront();
+        }
+        return outlookPage;
       },
-      snapshotText: async () => await this.currentPage().locator('body').innerText(),
+      pageInfo: async () => {
+        return await this.pageInformation();
+      },
+      snapshotText: async () => await this.snapshotText(),
       js: async (expression: string) => await this.evaluate(expression),
       click: async (target: ClickTarget) => await this.click(target),
       wait: async (seconds: number) => await this.currentPage().waitForTimeout(Math.max(0, seconds * 1_000)),
@@ -236,12 +327,11 @@ export class PlaywrightRunner implements BrowserScriptRunner {
 
   async close(): Promise<void> {
     this.cdpSession = null;
-    const context = this.context;
     const browser = this.browser;
     this.page = null;
     this.context = null;
     this.browser = null;
-    if (context && !this.config.cdpEndpoint) await context.close().catch(() => undefined);
-    if (browser) await browser.close().catch(() => undefined);
+    this.browserSession = null;
+    if (browser) await browser.close({ reason: 'webmail-cli command completed' }).catch(() => undefined);
   }
 }

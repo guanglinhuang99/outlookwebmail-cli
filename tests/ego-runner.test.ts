@@ -44,6 +44,13 @@ describe('EgoRunner', () => {
     });
   });
 
+  it('reports user-owned task-space control explicitly', async () => {
+    await expect(runner.run('console.error("agentDelegatedToUser"); process.exitCode = 7;', 2_000)).rejects.toMatchObject({
+      code: 'OUTLOOK_NOT_READY',
+      message: expect.stringContaining('控制权交还'),
+    });
+  });
+
   it('terminates a timed-out child', async () => {
     await expect(runner.run('setInterval(() => {}, 1000);', 50)).rejects.toMatchObject({
       code: 'TIMEOUT',

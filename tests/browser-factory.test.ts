@@ -18,6 +18,25 @@ describe('browser backend factory', () => {
     expect(createBrowserBackend({ ...common, env: { WEBMAIL_BACKEND: 'ego-lite' } }).name).toBe('ego-lite');
   });
 
+  it('keeps shared Edge on Playwright instead of creating an automatic fallback', () => {
+    const selected = createBrowserBackend({
+      cwd: '/work/repo', home: '/users/test', platform: 'darwin',
+      env: { WEBMAIL_SHARE_EDGE: 'true' },
+    });
+    expect(selected.name).toBe('playwright');
+  });
+
+  it('lets egolite mode override shared Edge and every Playwright backend setting', () => {
+    const selected = createBrowserBackend({
+      cwd: '/work/repo', home: '/users/test', platform: 'darwin',
+      env: {
+        WEBMAIL_MODE: 'egolite', WEBMAIL_SHARE_EDGE: 'true', WEBMAIL_BACKEND: 'playwright',
+        WEBMAIL_CDP_ENDPOINT: 'http://127.0.0.1:57652',
+      },
+    });
+    expect(selected.name).toBe('ego-lite');
+  });
+
   it('falls back once when Playwright cannot start', async () => {
     const primaryStatus = vi.fn(async () => { throw new AppError('BROWSER_NOT_FOUND', 'missing'); });
     const fallbackStatus = vi.fn(async () => ({ connected: true }));

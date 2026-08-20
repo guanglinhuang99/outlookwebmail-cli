@@ -61,6 +61,12 @@ export const INBOX_EXTRACT_SCRIPT = String.raw`
       : null;
     const previewBlock = subjectBlock ? subjectBlock.nextElementSibling : null;
     const markerTitles = Array.from(row.querySelectorAll('button[title]')).map(el => clean(el.getAttribute('title')));
+    const stableHint = [
+      row.getAttribute('data-item-id'),
+      row.getAttribute('data-message-id'),
+      row.getAttribute('data-convid'),
+      row.getAttribute('data-conversation-id')
+    ].map(clean).find(Boolean) || null;
 
     let unread = null;
     if (markerTitles.some(title => /标记为已读|mark as read/i.test(title))) unread = true;
@@ -69,7 +75,7 @@ export const INBOX_EXTRACT_SCRIPT = String.raw`
 
     const timeTitle = clean(timeElement && timeElement.getAttribute('title'));
     return {
-      stableHint: null,
+      stableHint,
       senderName: clean(senderElement ? senderElement.textContent : avatarElement && avatarElement.getAttribute('aria-label')) || null,
       senderAddress: clean(senderElement && senderElement.getAttribute('title')) || null,
       subject: clean(subjectElement && subjectElement.textContent),

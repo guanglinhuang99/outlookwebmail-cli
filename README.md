@@ -5,6 +5,10 @@
 `https://partner.outlook.cn/mail/`，不使用 Graph、EWS、IMAP、SMTP，
 也不读取 Cookie、Bearer Token 或浏览器 Storage。
 
+文档导航：[快速使用与 CLI/MCP 参考](README.md)、[Playwright 与 Ego Lite 实现说明](playwright-backend.md)、
+[测试与发布门槛](测试计划.md)。最初的 Ego Lite-only 技术路线保留在
+[Webmail-CLI-最简技术路线.md](Webmail-CLI-最简技术路线.md)，仅作为历史设计记录。
+
 ## 快速开始
 
 运行环境：Node.js 24+，以及已经安装的 Edge、Chrome 或 Chromium。`playwright-core` 不会自动下载浏览器。
@@ -27,7 +31,9 @@ webmail --version
 webmail status --json
 ```
 
-CLI 会使用专用持久化 Profile 打开 `https://partner.outlook.cn/mail/`。如果返回 `AUTH_REQUIRED`，
+CLI 会使用专用持久化 Profile 打开 `https://partner.outlook.cn/mail/`。浏览器通过本机 CDP 常驻；第一条命令
+的 `browserSession` 为 `launched`，后续命令复用同一窗口并返回 `reused`，不会为每条命令重新启动 Edge。
+如果返回 `AUTH_REQUIRED`，
 请在打开的浏览器窗口中手工登录，然后再次运行 `webmail status --json`。登录成功后建议执行：
 
 ```bash
@@ -51,6 +57,33 @@ webmail list --json
 
 ## CLI 使用
 
+### 选择运行模式
+
+不传模式参数时保持当前配置和默认行为：
+
+```bash
+webmail status --json
+```
+
+需要整条命令固定使用 Ego Lite 时，把全局参数放在子命令前：
+
+```bash
+webmail --mode egolite status --json
+webmail --mode egolite list --date 2026-08-20 --json
+```
+
+需要当前终端以及 MCP 全程使用 Ego Lite 时，设置统一环境变量：
+
+```bash
+export WEBMAIL_MODE=egolite
+webmail status --json
+```
+
+Windows PowerShell 使用 `$env:WEBMAIL_MODE = "egolite"`。MCP 配置则在 `env` 中加入
+`"WEBMAIL_MODE": "egolite"`。`egolite` 模式优先级最高，会忽略 `WEBMAIL_SHARE_EDGE`、
+`WEBMAIL_BACKEND`、`WEBMAIL_BROWSER`、`WEBMAIL_CDP_ENDPOINT`、Profile 和 headless 等 Playwright 配置。
+使用 `--mode default` 或 `WEBMAIL_MODE=default` 可恢复当前默认选择逻辑。
+
 一个典型的读取流程是先列目录，再列邮件，最后使用返回的 `stableId` 读取邮件：
 
 ```bash
@@ -70,7 +103,9 @@ webmail read m_xxxxxxxxxxxxxxxxxxxx --json
 webmail download-all m_xxxxxxxxxxxxxxxxxxxx --output ./downloads --json
 ```
 
-`list` 的 `--date` 默认是上海时区的今天，`--dir` 默认是 Inbox。返回 `nextCursor` 时，把它原样传给
+`list` 的 `--date` 默认是上海时区的今天，`--dir` 默认是 Inbox。单日查询会先选中目录，再使用 Outlook
+原生 `received:YYYY-MM-DD` 搜索。输出中的 `scope: "selected-folder"` 标明范围；`complete: false` 表示虚拟
+列表尚未扫描完，不能把当前页当作完整结果。返回 `nextCursor` 时，把它原样传给
 下一次命令即可继续翻页：
 
 ```bash
@@ -193,9 +228,32 @@ webmail status --json
 WEBMAIL_BACKEND=ego-lite webmail status --json
 ```
 
-可用环境变量：`WEBMAIL_BACKEND=auto|playwright|ego-lite`、
+复用日常 Edge 中已有的 Outlook 登录状态：先在 Edge 的 `edge://inspect` → `Remote debugging` 中启用
+“Allow remote debugging for this browser instance”，然后运行：
+
+```bash
+export WEBMAIL_SHARE_EDGE=true
+webmail status --json
+```
+
+Windows PowerShell：
+
+```powershell
+$env:WEBMAIL_SHARE_EDGE = "true"
+webmail status --json
+```
+
+CLI 会自动读取 Edge 用户数据目录中的 `DevToolsActivePort`，成功时 `status` 返回
+`browserSession: "shared-edge"`。共享模式不会启动或关闭 Edge，也不会在连接失败时回退到 Ego Lite；
+它可能新建或切换到 Outlook 标签页。由于远程调试对整个 Edge 实例具有较高权限，只有在你明确接受
+CLI 连接日常浏览器时才开启此选项。不要同时设置 `WEBMAIL_CDP_ENDPOINT`、`WEBMAIL_PROFILE_DIR`、
+`WEBMAIL_EXECUTABLE_PATH` 或 `WEBMAIL_HEADLESS=true`。
+
+可用环境变量：`WEBMAIL_MODE=default|egolite`、`WEBMAIL_BACKEND=auto|playwright|ego-lite`、
 `WEBMAIL_BROWSER=auto|edge|chrome|chromium`、`WEBMAIL_EXECUTABLE_PATH`、`WEBMAIL_PROFILE_DIR`、
-`WEBMAIL_HEADLESS`、`WEBMAIL_CDP_ENDPOINT`、`WEBMAIL_BROWSER_TIMEOUT_MS` 和 `WEBMAIL_URL`。
+`WEBMAIL_HEADLESS`、`WEBMAIL_CDP_ENDPOINT`、`WEBMAIL_SHARE_EDGE`、`WEBMAIL_BROWSER_TIMEOUT_MS`、`WEBMAIL_URL` 和
+`WEBMAIL_EGO_TASK_SPACE`。Ego Lite 默认使用 `webmail-cli-production`；自动化测试应显式设置不同名称，
+例如 `WEBMAIL_EGO_TASK_SPACE=webmail-cli-test`，避免测试 fixture 与真实邮箱会话碰撞。
 macOS/Linux 使用 `export WEBMAIL_BACKEND=playwright`；Windows `cmd.exe` 使用
 `set WEBMAIL_BACKEND=playwright`。环境变量只需要在自动发现失败或需要固定后端时配置。
 
@@ -206,7 +264,9 @@ macOS/Linux 使用 `export WEBMAIL_BACKEND=playwright`；Windows `cmd.exe` 使�
   `--from-date/--to-date`。`--dir` 省略或为空时使用 Inbox；`--sender`、`--subject`、`--unread`、
   `--has-attachments` 可组合筛选。每页最多 100 封，继续翻页时原样传回 `nextCursor`；游标与目录和筛选条件绑定。
 - `today`：不传 `--dir` 时列 Inbox 当日邮件；传入时列指定子目录的当日邮件。
-- `read`：返回邮件头、纯文本正文和附件元数据。
+- `read`：返回邮件头、纯文本正文和附件元数据。正文同时返回 `bodyBytes` 和 `bodyTruncated`；
+  `bodyTruncated=true` 表示页面正文超过 100 KiB，Agent 不应把当前文本当作完整正文。若列表记录显示邮件
+  原本未读，读取后会自动恢复为未读，并返回 `unreadRestored: true`；因此 `read` 的契约是保持原已读状态。
 - `attachments`：只返回附件名称和大小。
 - `compose`：支持 `to/cc/bcc/subject/content` 和可重复的 `--attach`。默认保存草稿并把编辑窗口交给用户；
   只有 `--draft false` 且提供唯一 `--request-id` 时才自动发送。
@@ -228,17 +288,20 @@ macOS/Linux 使用 `export WEBMAIL_BACKEND=playwright`；Windows `cmd.exe` 使�
   SHA-256 并汇总到 `_attachments-index.md`。
 - `watch`：轮询今天的邮件并把新增邮件逐行输出为 JSONL。首次运行默认只建立基线；
   `--emit-existing` 可输出现有邮件。状态默认保存在 `~/.webmail-cli/watch-state.json`，按日期和目录隔离；
-  `Ctrl+C` 安全停止。`--iterations` 可用于计划任务和测试，`0` 表示持续运行。
+  `Ctrl+C` 安全停止。`--iterations` 可用于计划任务和测试，`0` 表示持续运行。临时轮询失败会指数退避，
+  并输出 `watch.error`/`watch.recovered` 事件；连续失败 10 次或需要重新登录时停止。
 - `move`：只接受移动菜单中完全匹配的目录名，并要求 `--yes` 与唯一 `--request-id`。
 - `delete`：将邮件移入“已删除邮件”，并要求 `--yes` 与唯一 `--request-id`。
 
 自动新建/转发/回复、发送或放弃草稿、移动、归档和删除使用 request ID 防止 Agent 重试造成重复动作。
-审计不记录邮件主题、地址、正文或回复内容。
+如果点击后无法确认最终状态，命令返回 `OPERATION_UNKNOWN`，原 request ID 会被锁定；此时必须人工核查邮箱，
+禁止换用新 request ID 自动重试。审计不记录邮件主题、地址、正文或回复内容。
 
 ## MCP Server
 
 MCP Server 通过 stdio 向支持 MCP 的 Agent 提供标准邮件工具。先按照“快速开始”完成安装和构建；
-MCP 进程通常应由 MCP 客户端启动，不需要手工常驻运行。
+MCP 进程通常应由 MCP 客户端启动，不需要手工常驻运行。全部工具在同一 Outlook 浏览器会话中串行执行，
+避免 Agent 并发调用时相互切换目录、搜索结果或阅读窗格。
 
 如果已经执行 `npm link`，MCP 客户端可以直接启动 `webmail-mcp`：
 

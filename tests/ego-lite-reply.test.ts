@@ -35,6 +35,23 @@ function expectValidBrowserScript(script: string): void {
 }
 
 describe('EgoLiteBackend reply', () => {
+  it('builds strict deletion and move verification scripts', async () => {
+    const performed = { matchCount: 1, status: 'performed' as const, performed: true, verified: true };
+    for (const action of ['delete', 'move'] as const) {
+      const run = vi.fn()
+        .mockResolvedValueOnce({ stdout: '', stderr: '', value: { matchCount: 1, message } })
+        .mockResolvedValueOnce({ stdout: '', stderr: '', value: performed });
+      const backend = new EgoLiteBackend({ run } as unknown as EgoRunner);
+      if (action === 'delete') await backend.deleteMessage(locator);
+      else await backend.moveMessage(locator, '投后');
+      const script = run.mock.calls[1]?.[0] as string;
+      expectValidBrowserScript(script);
+      expect(script).toContain('data-item-id');
+      expect(script).toContain('role=\\"status');
+      expect(script).not.toContain('if (!pane) return true');
+    }
+  });
+
   it('builds a reply-all draft script that inserts content and hands off control', async () => {
     const replyResult: ReplyActionResult = {
       matchCount: 1,

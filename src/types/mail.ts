@@ -51,7 +51,10 @@ export interface MailMessage {
   receivedAt: string | null;
   receivedAtText: string | null;
   bodyText: string;
+  bodyTruncated: boolean;
+  bodyBytes: number;
   attachments: AttachmentSummary[];
+  unreadRestored: boolean;
 }
 
 export interface RawMessageRow {
@@ -75,6 +78,8 @@ export interface RawMessage {
   receivedAt: string | null;
   receivedAtText: string | null;
   bodyText: string;
+  bodyTruncated?: boolean;
+  bodyBytes?: number;
   attachments: Array<{
     filename: string;
     sizeText: string | null;
@@ -82,6 +87,8 @@ export interface RawMessage {
 }
 
 export interface MessageLocator {
+  stableHint?: string | null;
+  stableId?: string;
   subject: string;
   senderName: string | null;
   senderAddress: string | null;
@@ -89,6 +96,7 @@ export interface MessageLocator {
   receivedAtText: string | null;
   preview: string | null;
   hasAttachments: boolean | null;
+  unread?: boolean | null;
 }
 
 export interface MessageOpenResult {
@@ -276,7 +284,7 @@ export interface DownloadAllResult {
   attachments: DownloadedAttachmentWithHash[];
 }
 
-export interface ConversationMessage extends Omit<MailMessage, 'id' | 'stableId'> {
+export interface ConversationMessage extends Omit<MailMessage, 'id' | 'stableId' | 'unreadRestored'> {
   index: number;
 }
 

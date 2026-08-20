@@ -1,19 +1,22 @@
 import { constants } from 'node:fs';
 import { access, chmod, mkdir, realpath } from 'node:fs/promises';
 import { homedir } from 'node:os';
-import { delimiter, isAbsolute, join, resolve } from 'node:path';
+import { delimiter, isAbsolute, join, relative, resolve, sep } from 'node:path';
 import { AppError } from '../util/errors.js';
 
 export type BrowserChoice = 'auto' | 'edge' | 'chrome' | 'chromium';
 export type BackendChoice = 'auto' | 'playwright' | 'ego-lite';
+export type RuntimeMode = 'default' | 'egolite';
 
 export interface PlaywrightConfig {
+  mode: RuntimeMode;
   backend: BackendChoice;
   browser: BrowserChoice;
   executablePath: string | null;
   profileDir: string;
   headless: boolean;
   cdpEndpoint: string | null;
+  shareEdge: boolean;
   timeoutMs: number;
   outlookUrl: string;
 }
@@ -77,8 +80,8 @@ function assertOutlookUrl(rawUrl: string): string {
 }
 
 function inside(candidate: string, parent: string): boolean {
-  const relative = resolve(candidate).slice(resolve(parent).length);
-  return resolve(candidate) === resolve(parent) || (relative.startsWith('/') || relative.startsWith('\\'));
+  const relation = relative(resolve(parent), resolve(candidate));
+  return relation === '' || (relation !== '..' && !relation.startsWith(`..${sep}`) && !isAbsolute(relation));
 }
 
 function validateProfilePath(profileDir: string, cwd: string, platform: NodeJS.Platform): void {
@@ -101,22 +104,51 @@ export function loadPlaywrightConfig(options: ConfigOptions = {}): PlaywrightCon
   const platform = options.platform ?? process.platform;
   const cwd = resolve(options.cwd ?? process.cwd());
   const home = options.home ?? homedir();
-  const backend = enumValue(env.WEBMAIL_BACKEND, ['auto', 'playwright', 'ego-lite'] as const, 'auto', 'WEBMAIL_BACKEND');
-  const browser = enumValue(env.WEBMAIL_BROWSER, ['auto', 'edge', 'chrome', 'chromium'] as const, 'auto', 'WEBMAIL_BROWSER');
-  const executablePath = env.WEBMAIL_EXECUTABLE_PATH?.trim() || null;
-  const cdpEndpoint = env.WEBMAIL_CDP_ENDPOINT?.trim() || null;
+  const mode = enumValue(env.WEBMAIL_MODE, ['default', 'egolite'] as const, 'default', 'WEBMAIL_MODE');
+  const backend = mode === 'egolite'
+    ? 'ego-lite'
+    : enumValue(env.WEBMAIL_BACKEND, ['auto', 'playwright', 'ego-lite'] as const, 'auto', 'WEBMAIL_BACKEND');
+  const browser = mode === 'egolite'
+    ? 'auto'
+    : enumValue(env.WEBMAIL_BROWSER, ['auto', 'edge', 'chrome', 'chromium'] as const, 'auto', 'WEBMAIL_BROWSER');
+  const executablePath = mode === 'egolite' ? null : env.WEBMAIL_EXECUTABLE_PATH?.trim() || null;
+  const cdpEndpoint = mode === 'egolite' ? null : env.WEBMAIL_CDP_ENDPOINT?.trim() || null;
+  const shareEdge = mode === 'egolite' ? false : booleanValue(env.WEBMAIL_SHARE_EDGE, false, 'WEBMAIL_SHARE_EDGE');
+  const headless = mode === 'egolite' ? false : booleanValue(env.WEBMAIL_HEADLESS, false, 'WEBMAIL_HEADLESS');
   if (cdpEndpoint && executablePath) {
     throw new AppError('INVALID_ARGUMENT', 'WEBMAIL_CDP_ENDPOINT 与 WEBMAIL_EXECUTABLE_PATH 不能同时设置。');
   }
-  const profileDir = resolve(env.WEBMAIL_PROFILE_DIR?.trim() || defaultProfileDir(platform, env, home));
+  if (shareEdge && cdpEndpoint) {
+    throw new AppError('INVALID_ARGUMENT', 'WEBMAIL_SHARE_EDGE=true 时不能同时设置 WEBMAIL_CDP_ENDPOINT。');
+  }
+  if (shareEdge && executablePath) {
+    throw new AppError('INVALID_ARGUMENT', 'WEBMAIL_SHARE_EDGE=true 时不能同时设置 WEBMAIL_EXECUTABLE_PATH。');
+  }
+  if (shareEdge && env.WEBMAIL_PROFILE_DIR?.trim()) {
+    throw new AppError('INVALID_ARGUMENT', 'WEBMAIL_SHARE_EDGE=true 时使用日常 Edge 会话，不能同时设置 WEBMAIL_PROFILE_DIR。');
+  }
+  if (shareEdge && browser !== 'auto' && browser !== 'edge') {
+    throw new AppError('INVALID_ARGUMENT', 'WEBMAIL_SHARE_EDGE=true 只支持 WEBMAIL_BROWSER=auto 或 edge。');
+  }
+  if (shareEdge && backend === 'ego-lite') {
+    throw new AppError('INVALID_ARGUMENT', 'WEBMAIL_SHARE_EDGE=true 不能与 WEBMAIL_BACKEND=ego-lite 同时使用。');
+  }
+  if (shareEdge && headless) {
+    throw new AppError('INVALID_ARGUMENT', 'WEBMAIL_SHARE_EDGE=true 不能与 WEBMAIL_HEADLESS=true 同时使用。');
+  }
+  const profileDir = resolve(
+    mode === 'egolite' ? defaultProfileDir(platform, env, home) : env.WEBMAIL_PROFILE_DIR?.trim() || defaultProfileDir(platform, env, home),
+  );
   validateProfilePath(profileDir, cwd, platform);
   return {
+    mode,
     backend,
     browser,
     executablePath,
     profileDir,
-    headless: booleanValue(env.WEBMAIL_HEADLESS, false, 'WEBMAIL_HEADLESS'),
+    headless,
     cdpEndpoint,
+    shareEdge,
     timeoutMs: timeoutValue(env.WEBMAIL_BROWSER_TIMEOUT_MS),
     outlookUrl: assertOutlookUrl(env.WEBMAIL_URL?.trim() || 'https://partner.outlook.cn/mail/'),
   };
@@ -196,19 +228,48 @@ export async function resolveBrowserExecutable(
   throw new AppError('BROWSER_NOT_FOUND', '未找到 Edge、Chrome 或 Chromium；请安装浏览器或设置 WEBMAIL_EXECUTABLE_PATH。');
 }
 
-export async function prepareProfileDirectory(config: PlaywrightConfig): Promise<void> {
-  if (config.cdpEndpoint) return;
-  await mkdir(config.profileDir, { recursive: true, mode: 0o700 });
-  const actual = await realpath(config.profileDir);
-  if (inside(actual, process.cwd())) {
-    throw new AppError('INVALID_ARGUMENT', 'WEBMAIL_PROFILE_DIR 解析后位于代码仓库中。');
+export async function prepareProfileDirectory(
+  config: PlaywrightConfig,
+  options: {
+    mkdirFn?: typeof mkdir;
+    realpathFn?: typeof realpath;
+    accessFn?: typeof access;
+    chmodFn?: typeof chmod;
+    cwd?: string;
+    platform?: NodeJS.Platform;
+  } = {},
+): Promise<void> {
+  if (config.cdpEndpoint || config.shareEdge) return;
+  const mkdirFn = options.mkdirFn ?? mkdir;
+  const realpathFn = options.realpathFn ?? realpath;
+  const accessFn = options.accessFn ?? access;
+  const chmodFn = options.chmodFn ?? chmod;
+  try {
+    await mkdirFn(config.profileDir, { recursive: true, mode: 0o700 });
+    const actual = await realpathFn(config.profileDir);
+    if (inside(actual, options.cwd ?? process.cwd())) {
+      throw new AppError('INVALID_ARGUMENT', 'WEBMAIL_PROFILE_DIR 解析后位于代码仓库中。');
+    }
+    await accessFn(actual, constants.W_OK);
+    if ((options.platform ?? process.platform) !== 'win32') await chmodFn(actual, 0o700);
+  } catch (error) {
+    if (error instanceof AppError) throw error;
+    const code = (error as NodeJS.ErrnoException).code;
+    if (code === 'EACCES' || code === 'EPERM' || code === 'EROFS') {
+      throw new AppError(
+        'PROFILE_ACCESS_DENIED',
+        `无法创建或写入 Playwright 专用 Profile：${config.profileDir}。请检查目录权限，或用 WEBMAIL_PROFILE_DIR 指定可写的专用绝对路径。`,
+        { cause: error },
+      );
+    }
+    throw error;
   }
-  if (process.platform !== 'win32') await chmod(actual, 0o700);
 }
 
 export function redactCdpEndpoint(endpoint: string): string {
   try {
     const url = new URL(endpoint);
+    if (url.protocol === 'ws:' || url.protocol === 'wss:') return `${url.protocol}//${url.host}/<redacted>`;
     return `${url.protocol}//${url.host}${url.pathname}`;
   } catch {
     return '<configured endpoint>';

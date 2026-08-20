@@ -15,6 +15,11 @@ export class PlaywrightBackend extends EgoLiteBackend {
 
   override async status() {
     const status = await super.status();
-    return { ...status, browserName: this.playwrightRunner.executable?.name ?? (this.playwrightRunner.config.cdpEndpoint ? 'cdp' : null) };
+    return {
+      ...status,
+      browserName: this.playwrightRunner.executable?.name
+        ?? (this.playwrightRunner.config.shareEdge ? 'edge' : this.playwrightRunner.config.cdpEndpoint ? 'cdp' : null),
+      browserSession: this.playwrightRunner.session,
+    };
   }
 }

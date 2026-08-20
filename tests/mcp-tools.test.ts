@@ -1,5 +1,6 @@
 import { describe, expect, it, vi } from 'vitest';
 import type { OutlookService } from '../src/outlook/service.js';
+import { createSerialExecutor } from '../src/mcp/server.js';
 import { createWebmailTools, invokeWebmailTool } from '../src/mcp/tools.js';
 
 describe('MCP webmail tools', () => {
@@ -24,5 +25,19 @@ describe('MCP webmail tools', () => {
     expect(result.structuredContent).toMatchObject({ error: { code: 'INVALID_ARGUMENT' } });
     expect(result.content[0]!.text).not.toContain('stack');
     expect(service.delete).not.toHaveBeenCalled();
+  });
+
+  it('serializes stateful browser operations even when MCP calls arrive concurrently', async () => {
+    const serial = createSerialExecutor();
+    const order: string[] = [];
+    let releaseFirst!: () => void;
+    const gate = new Promise<void>(resolve => { releaseFirst = resolve; });
+    const first = serial(async () => { order.push('first:start'); await gate; order.push('first:end'); });
+    const second = serial(async () => { order.push('second:start'); order.push('second:end'); });
+    await Promise.resolve();
+    expect(order).toEqual(['first:start']);
+    releaseFirst();
+    await Promise.all([first, second]);
+    expect(order).toEqual(['first:start', 'first:end', 'second:start', 'second:end']);
   });
 });

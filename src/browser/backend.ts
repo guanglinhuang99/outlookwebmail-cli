@@ -1,4 +1,4 @@
-import type { BrowserStatus, InspectResult, LoginHandoffResult, MessageInspectResult } from '../types/inspect.js';
+import type { BrowserStatus, InspectResult, LoginHandoffResult, MailReadyProbe, MessageInspectResult } from '../types/inspect.js';
 import type {
   AttachmentDownloadResult,
   ComposeActionResult,
@@ -19,6 +19,7 @@ import type {
 export interface BrowserBackend {
   readonly name?: BrowserBackendName;
   status(): Promise<BrowserStatus>;
+  waitUntilMailReady(timeoutMs?: number): Promise<MailReadyProbe>;
   handoffForLogin(): Promise<LoginHandoffResult>;
   snapshot(): Promise<string>;
   eval<T>(script: string): Promise<T>;

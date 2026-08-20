@@ -5,7 +5,7 @@ import { loadPlaywrightConfig, type ConfigOptions } from './playwright-config.js
 
 function canFallback(error: unknown): boolean {
   if (!error || typeof error !== 'object' || !('code' in error)) return false;
-  return ['BROWSER_NOT_FOUND', 'PROFILE_LOCKED', 'PLAYWRIGHT_ERROR', 'PLAYWRIGHT_TIMEOUT'].includes(String(error.code));
+  return ['BROWSER_NOT_FOUND', 'PROFILE_ACCESS_DENIED', 'PROFILE_LOCKED', 'PLAYWRIGHT_ERROR', 'PLAYWRIGHT_TIMEOUT'].includes(String(error.code));
 }
 
 export function createFallbackBackend(primary: BrowserBackend, fallback: BrowserBackend): BrowserBackend {
@@ -50,6 +50,6 @@ export function createBrowserBackend(options: ConfigOptions = {}): BrowserBacken
   const config = loadPlaywrightConfig(options);
   if (config.backend === 'ego-lite') return new EgoLiteBackend();
   const playwright = new PlaywrightBackend(config);
-  if (config.backend === 'playwright') return playwright;
+  if (config.backend === 'playwright' || config.shareEdge) return playwright;
   return createFallbackBackend(playwright, new EgoLiteBackend());
 }

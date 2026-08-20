@@ -1,8 +1,10 @@
-# Playwright Backend 方案（方案 1）
+# Playwright Backend 方案与实现说明
+
+> 状态：方案 1 已实现。本文保留设计决策、模块边界和验收标准；实际安装、命令和运行模式请以 [README.md](README.md) 为准。
 
 ## 1. 目标与边界
 
-本方案为 `webmail-cli` 增加一个可选的 Playwright 浏览器后端，用于替换当前的 Ego Lite 后端。目标是：
+本方案为 `webmail-cli` 增加 Playwright 浏览器后端，并保留 Ego Lite 作为可选后端。目标是：
 
 - 不要求安装 Ego Lite App；
 - 支持 Windows、macOS、Linux；
@@ -11,7 +13,7 @@
 - 让 Playwright 后端和现有 `BrowserBackend` 接口可互换；
 - 对删除、移动、回复、发送等有副作用的操作继续使用现有确认、草稿和 request-id 安全机制。
 
-本文件是实施方案，不包含本次的代码实现。第一版仍保留 Ego Lite 后端，Playwright 后端通过配置显式启用，待跨平台验证完成后再评估是否改为默认后端。
+当前实现默认使用 `auto` 后端：优先使用 Playwright，启动失败时尝试 Ego Lite。需要强制整个 CLI 或 MCP 使用 Ego Lite 时，设置 `WEBMAIL_MODE=egolite`，或在单次 CLI 命令前加 `--mode egolite`；该模式会覆盖 Playwright、CDP、Edge 共享和 Profile 配置。
 
 ## 2. 技术决策
 
@@ -27,7 +29,7 @@ playwright-core + 用户已经安装的 Chrome / Edge / Chromium
 
 如果后续希望让项目自带固定版本的 Chromium，才改用完整的 `playwright`，并执行 `npx playwright install chromium`。这会降低系统浏览器差异，但增加安装包体积和升级维护成本。
 
-建议的依赖变更（实施阶段再执行）：
+当前依赖：
 
 ```bash
 npm install playwright-core
@@ -58,26 +60,29 @@ Playwright 通过 `launchPersistentContext(profileDir, options)` 打开该目录
 
 ## 3. 用户配置
 
-建议新增以下配置，环境变量、配置文件和 CLI 全局参数的优先级沿用项目现有配置规则：
+当前配置（环境变量和 CLI 全局参数）：
 
 | 配置 | 默认值 | 说明 |
 | --- | --- | --- |
+| `WEBMAIL_MODE` | `default` | `default` 保持当前配置；`egolite` 强制全程使用 Ego Lite |
 | `WEBMAIL_BACKEND` | 当前兼容默认值 | `ego-lite` 或 `playwright` |
 | `WEBMAIL_BROWSER` | `auto` | `edge`、`chrome`、`chromium` 或 `auto` |
 | `WEBMAIL_EXECUTABLE_PATH` | 空 | 明确指定浏览器可执行文件，优先级最高 |
 | `WEBMAIL_PROFILE_DIR` | 平台用户数据目录下的 `webmail-cli` | Playwright 专用持久化 Profile |
 | `WEBMAIL_HEADLESS` | `false` | 调试和无人值守场景可设为 `true` |
 | `WEBMAIL_CDP_ENDPOINT` | 空 | 可选的 Chromium CDP 地址；设置后不再使用 executable/profile 启动模式 |
+| `WEBMAIL_SHARE_EDGE` | `false` | 复用已开启远程调试的日常 Edge；不与 `WEBMAIL_MODE=egolite` 同时生效 |
 | `WEBMAIL_BROWSER_TIMEOUT_MS` | 30000 | 页面动作和等待的统一超时 |
 | `WEBMAIL_URL` | `https://partner.outlook.cn/mail/` | 仅允许 Outlook 目标域名 |
 
 配置校验规则：
 
-1. `WEBMAIL_BACKEND=playwright` 时才读取 Playwright 配置。
-2. `WEBMAIL_CDP_ENDPOINT` 与 `WEBMAIL_EXECUTABLE_PATH`、持久化启动模式互斥。
-3. `WEBMAIL_PROFILE_DIR` 必须是专用目录，不能是 Chrome/Edge 默认用户数据根目录，也不能是仓库目录。
-4. 指定的可执行文件必须存在且可执行；自动发现失败时给出安装和配置提示。
-5. `WEBMAIL_URL` 只能是配置允许的 Outlook 域名，禁止把后端变成任意网站浏览器。
+1. `WEBMAIL_MODE=egolite` 优先级最高，忽略 Playwright、CDP、Edge 共享和 Profile 相关选择。
+2. 默认模式按 `WEBMAIL_BACKEND` 选择后端；`auto` 优先 Playwright，失败后回退 Ego Lite。
+3. `WEBMAIL_CDP_ENDPOINT` 与 `WEBMAIL_EXECUTABLE_PATH`、持久化启动模式互斥。
+4. `WEBMAIL_PROFILE_DIR` 必须是专用目录，不能是 Chrome/Edge 默认用户数据根目录，也不能是仓库目录。
+5. 指定的可执行文件必须存在且可执行；自动发现失败时给出安装和配置提示。
+6. `WEBMAIL_URL` 只能是配置允许的 Outlook 域名，禁止把后端变成任意网站浏览器。
 
 ## 4. 跨平台浏览器发现
 
@@ -108,17 +113,18 @@ CLI
           -> PlaywrightBackend（新增）
 ```
 
-建议新增以下模块：
+实际模块：
 
 ```text
 src/browser/playwright.ts          # PlaywrightBackend 生命周期与动作
 src/browser/playwright-config.ts   # 配置、Profile 和可执行文件发现
 src/browser/browser-factory.ts     # 根据 WEBMAIL_BACKEND 创建后端
-src/browser/playwright-errors.ts   # Playwright 错误映射
-src/browser/dom-probes.ts          # 页面探针、选择器和解析辅助
+src/browser/playwright-runner.ts   # Playwright Page/Context 操作与复用
+src/browser/managed-cdp.ts         # 本地 CDP 常驻浏览器管理
+src/browser/shared-edge.ts         # 日常 Edge 远程调试端口发现与连接
+src/outlook/inbox-parser.ts        # 列表、目录和附件 DOM 解析
+src/outlook/message-parser.ts      # 邮件详情 DOM 解析
 ```
-
-如果现有 DOM 解析逻辑已经集中在 `EgoLiteBackend`，应先把纯解析函数抽到 `dom-probes.ts`，再让两个后端共同调用。抽取只保留与当前任务相关的代码，不借机重构服务层。
 
 `PlaywrightBackend` 只负责浏览器生命周期、页面动作、下载和 DOM 探针；邮件筛选、日期处理、目录语义、request-id 去重、审计记录仍由 `OutlookService` 和现有安全模块负责。
 
@@ -340,16 +346,18 @@ CLI 进程在该模式下应保持 Context 存活，直到用户按回车确认�
 
 ## 11. 分阶段实施
 
-### Phase 0：配置和工厂
+### 已完成：配置、工厂、生命周期和业务接入
 
 - 新增 Playwright 配置、浏览器发现和 Profile 校验；
 - 增加 `createBrowserBackend()`；
-- 保持现有 Ego Lite 默认行为；
+- 保留 Ego Lite 后端，并支持 `WEBMAIL_MODE=egolite` 强制选择；
 - 增加 `status --json` 中的后端和浏览器诊断字段。
 
-验收：不安装 Playwright 浏览器时，配置错误能给出清晰提示；现有 Ego Lite 测试不回归。
+验收：配置、工厂、Ego Lite/Playwright 路由及错误提示均有自动化测试覆盖。
 
-### Phase 1：生命周期、登录和只读探针
+### 已完成：生命周期、登录和只读探针
+
+实现内容包括：
 
 - 实现持久化 Context、Page 复用、登录检测；
 - 实现 `status`、`snapshot`、`inspect`、`inspectMessage`；
@@ -357,7 +365,9 @@ CLI 进程在该模式下应保持 Context 存活，直到用户按回车确认�
 
 验收：首次运行能打开可见 Outlook 页面并提示手工登录，第二次运行复用专用 Profile。
 
-### Phase 2：邮件读取能力
+### 已完成：邮件读取能力
+
+实现内容包括：
 
 - 实现目录树、Inbox/目录选择、列表、日期过滤、搜索；
 - 实现邮件详情、附件列表和单附件下载；
@@ -365,7 +375,9 @@ CLI 进程在该模式下应保持 Context 存活，直到用户按回车确认�
 
 验收：CLI 现有 list/read/search/export/download 命令不需要改业务参数即可切换后端。
 
-### Phase 3：写操作
+### 已完成：写操作和安全策略接入
+
+实现内容包括：
 
 - 实现 compose、reply/replyAll、forward、drafts；
 - 实现删除、移动、读状态、旗标、分类和归档；
@@ -373,12 +385,13 @@ CLI 进程在该模式下应保持 Context 存活，直到用户按回车确认�
 
 验收：草稿模式不会发送；自动发送只有在成功提示/状态变化验证后才返回成功。
 
-### Phase 4：跨平台发布与默认值评估
+### 发布与后续验证
 
-- 完成 Windows/macOS/Linux 冒烟矩阵；
+- 规划并执行 Windows/macOS/Linux 冒烟矩阵；
 - 更新 README、安装诊断和故障排查；
-- 评估是否将 `WEBMAIL_BACKEND=playwright` 改为默认；
-- 决定是否额外提供完整 `playwright` 安装模式。
+- 当前默认已经是 `auto`，优先 Playwright；`WEBMAIL_MODE=egolite` 用于兼容和显式切换。
+- 发布包由 `npm run package:release` 生成，包含 npm 包、macOS/Windows ZIP 和 SHA-256 校验文件。
+- Windows、macOS、Linux 的真实浏览器冒烟仍应在对应机器执行，不能由本地单元测试替代。
 
 ## 12. 验收标准
 
@@ -406,13 +419,14 @@ CLI 进程在该模式下应保持 Context 存活，直到用户按回车确认�
 
 ## 14. 计划中的命令与文档更新
 
-实现阶段再执行：
+实现和发布前执行：
 
 ```bash
 npm install playwright-core
 npm run check
 npm test
 npm run build
+git diff --check
 ```
 
 建议增加的使用示例：
@@ -432,7 +446,7 @@ WEBMAIL_EXECUTABLE_PATH="/Applications/Google Chrome.app/Contents/MacOS/Google C
 webmail status
 ```
 
-README 需要说明：方案 1 不要求安装 Ego Lite，但要求系统存在受支持的浏览器；`playwright-core` 不会自动下载浏览器；首次登录由用户在可见窗口完成；专用 Profile 与日常浏览器登录态是隔离的。若用户要求直接复用已经打开的日常浏览器，则需自行开启 CDP，且不作为默认推荐方案。
+README 已说明：方案 1 不要求安装 Ego Lite，但要求系统存在受支持的浏览器；`playwright-core` 不会自动下载浏览器；首次登录由用户在可见窗口完成；专用 Profile 与日常浏览器登录态是隔离的。若用户要求直接复用已经打开的日常 Edge，则需开启远程调试并设置 `WEBMAIL_SHARE_EDGE=true`；如需全程回到 Ego Lite，使用 `--mode egolite` 或 `WEBMAIL_MODE=egolite`。
 
 ## 15. 官方资料
 

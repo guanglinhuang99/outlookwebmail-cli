@@ -20,6 +20,18 @@ export interface BrowserStatus {
   page: PageInfo;
   snapshot: string;
   browserName?: string | null;
+  browserSession?: 'launched' | 'reused' | 'external-cdp' | 'shared-edge' | null;
+}
+
+export interface MailReadyProbe {
+  ready: boolean;
+  url: string | null;
+  title: string | null;
+  searchInputs: number;
+  inboxFolders: number;
+  mailLists: number;
+  loginFrames: number;
+  busy: boolean;
 }
 
 export interface LoginHandoffResult {
@@ -34,6 +46,8 @@ export interface StatusResult {
   url: string;
   title: string | null;
   state: OutlookState;
+  mailReady: boolean;
+  browserSession?: 'launched' | 'reused' | 'external-cdp' | 'shared-edge' | null;
 }
 
 export interface DoctorCheck {

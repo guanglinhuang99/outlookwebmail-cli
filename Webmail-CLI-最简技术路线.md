@@ -1,9 +1,11 @@
 # Webmail CLI 最简技术路线（Ego Lite 优先）
 
+> 历史说明：本文记录项目最初的 Ego Lite-only 方案和编码提示，不是当前实现的完整使用手册。当前版本已经增加 Playwright、Edge 共享、MCP、Obsidian 同步、跨平台打包以及统一启动模式；请以 [README.md](README.md) 和 [playwright-backend.md](playwright-backend.md) 为准。
+
 > 版本：v1.0
 > 目标：把已经登录的 `https://partner.outlook.cn/mail/` Webmail 变成一个本地 CLI，供 Codex / Claude Code / OpenCode 等 AI 通过 shell 直接调用。
 > 核心路线：**Node.js CLI + Ego Lite (`ego-browser`) + DOM 解析**。
-> 设计原则：**单用户、本地使用、简单优先，不做浏览器插件、不做 MCP、不做 REST、不做审计、多用户、权限系统和数据库。**
+> 初始设计原则：**单用户、本地使用、简单优先。** 后续版本已按实际需求增加 MCP、审计、幂等安全和跨平台浏览器后端。
 
 ---
 

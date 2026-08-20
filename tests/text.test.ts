@@ -19,4 +19,18 @@ describe('mail text helpers', () => {
     expect(first).toMatch(/^m_[A-Za-z0-9_-]{20}$/);
     expect(first).not.toContain('user');
   });
+
+  it('separates messages from the same sender and minute by preview', () => {
+    const first = stableMessageId({ senderAddress: 'robot@example.com', subject: 'Alert', receivedAt: '2026-08-20T09:00:00+08:00', preview: 'first' });
+    const second = stableMessageId({ senderAddress: 'robot@example.com', subject: 'Alert', receivedAt: '2026-08-20T09:00:00+08:00', preview: 'second' });
+    expect(first).not.toBe(second);
+  });
+
+  it('prefers a DOM stable hint over mutable preview text', () => {
+    const first = stableMessageId({ stableHint: 'AQMk-message-1', subject: 'old', preview: 'old' });
+    const second = stableMessageId({ stableHint: 'AQMk-message-1', subject: 'new', preview: 'new' });
+    expect(first).toBe(second);
+    expect(stableMessageId({ stableHint: 'AQMk-message-1', subject: 'old' }))
+      .not.toBe(stableMessageId({ stableHint: 'aqmk-message-1', subject: 'old' }));
+  });
 });
