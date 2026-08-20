@@ -1,0 +1,21 @@
+webmail-cli Windows 安装说明
+============================
+
+要求：
+1. Windows 已安装 Node.js 24 或更高版本。
+2. 已安装 Microsoft Edge、Chrome 或 Chromium。
+3. 安装时需要联网下载生产依赖。
+
+安装：
+1. 解压整个 ZIP，不要直接在压缩包预览窗口中运行。
+2. 双击 install.cmd。
+3. 安装完成后打开新的 PowerShell 或 CMD。
+4. 运行：webmail status --json
+5. 在浏览器中完成 Outlook 登录后，再次运行同一命令。
+
+命令：
+- webmail：CLI
+- webmail-mcp：供 MCP 客户端启动的 stdio Server
+
+详细用法见项目 README：
+https://github.com/guanglinhuang99/outlookwebmail-cli

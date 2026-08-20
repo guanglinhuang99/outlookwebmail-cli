@@ -1,23 +1,33 @@
 {
   "name": "webmail-cli",
-  "version": "0.2.0",
-  "description": "Local Outlook Web CLI powered by Ego Lite",
+  "version": "0.3.0",
+  "description": "Cross-platform local Outlook Web CLI powered by Playwright",
   "type": "module",
   "private": true,
+  "files": [
+    "dist/",
+    "README.md"
+  ],
   "bin": {
-    "webmail": "./dist/cli.js"
+    "webmail": "./dist/cli.js",
+    "webmail-mcp": "./dist/mcp/stdio.js"
   },
   "scripts": {
     "build": "tsc -p tsconfig.json",
     "check": "tsc -p tsconfig.json --noEmit",
     "dev": "tsx src/cli.ts",
+    "mcp": "node dist/mcp/stdio.js",
+    "package:release": "node scripts/package-release.mjs",
+    "prepack": "npm run build",
     "test": "vitest run"
   },
   "engines": {
     "node": ">=24"
   },
   "dependencies": {
+    "@modelcontextprotocol/server": "^2.0.0",
     "commander": "^14.0.0",
+    "playwright-core": "^1.62.1",
     "zod": "^4.0.0"
   },
   "devDependencies": {

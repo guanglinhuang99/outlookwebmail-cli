@@ -22,6 +22,7 @@ import type {
   MessageLocator,
   MessageStateActionResult,
   ObsidianExportResult,
+  ObsidianSyncResult,
   RawMessageRow,
   ReplyActionResult,
   ReplyResult,
@@ -41,6 +42,7 @@ import {
   renderObsidianMarkdown,
   writeMarkdownAtomically,
 } from '../export/obsidian.js';
+import { syncObsidian } from '../sync/obsidian-sync.js';
 
 const SEARCH_SELECTOR = 'input[role="combobox"][aria-label^="搜索"], input[role="combobox"][aria-label^="Search"]';
 const EXIT_SEARCH_SELECTOR = 'button[aria-label="退出搜索"], button[aria-label="Exit search"]';
@@ -250,6 +252,14 @@ export class OutlookService {
     this.folderParser = new FolderParser(backend);
   }
 
+  private backendName(): 'ego-lite' | 'playwright' {
+    return this.backend.name ?? 'ego-lite';
+  }
+
+  async close(): Promise<void> {
+    await this.backend.close?.();
+  }
+
   private locatorForRow(row: RawMessageRow): MessageLocator {
     return {
       subject: row.subject,
@@ -306,23 +316,31 @@ export class OutlookService {
     const url = requirePageUrl(page);
     if (detectOutlookState(url, snapshot) !== 'AUTH_REQUIRED') return url;
 
+    const backendName = this.backendName();
+
     try {
       const handoff = await this.backend.handoffForLogin();
       if (handoff.handedOff) {
         throw new AppError(
           'AUTH_REQUIRED',
-          '已在 Ego Lite 中打开 Outlook 并将页面交给你。请完成登录，再将控制权交还给 Agent，然后重新执行命令。',
+          backendName === 'playwright'
+            ? '已在 Playwright 浏览器中打开 Outlook。请完成登录，然后重新执行命令。'
+            : '已在 Ego Lite 中打开 Outlook 并将页面交给你。请完成登录，再将控制权交还给 Agent，然后重新执行命令。',
         );
       }
       throw new AppError(
         'AUTH_REQUIRED',
-        '已在 Ego Lite 中打开 Outlook，但未能把页面控制权交给你；请打开 Ego Lite 完成登录后重试。',
+        backendName === 'playwright'
+          ? '已打开 Outlook，但浏览器窗口不可交互；请设置 WEBMAIL_HEADLESS=false 后完成登录。'
+          : '已在 Ego Lite 中打开 Outlook，但未能把页面控制权交给你；请打开 Ego Lite 完成登录后重试。',
       );
     } catch (error) {
       if (error instanceof AppError && error.code === 'AUTH_REQUIRED') throw error;
       throw new AppError(
         'AUTH_REQUIRED',
-        'Outlook 尚未登录；已尝试在 Ego Lite 中打开登录页面，但控制权交接失败。请打开 Ego Lite 登录后重试。',
+        backendName === 'playwright'
+          ? 'Outlook 尚未登录；Playwright 无法打开登录页面，请检查浏览器配置后重试。'
+          : 'Outlook 尚未登录；已尝试在 Ego Lite 中打开登录页面，但控制权交接失败。请打开 Ego Lite 登录后重试。',
         { cause: error },
       );
     }
@@ -398,7 +416,8 @@ export class OutlookService {
     const observation = await this.backend.status();
     const url = await this.requireAuthenticatedPage(observation.page, observation.snapshot);
     return {
-      backend: 'ego-lite',
+      backend: this.backendName(),
+      browser: observation.browserName ?? null,
       url,
       title: observation.title,
       state: detectOutlookState(url, observation.snapshot),
@@ -417,14 +436,18 @@ export class OutlookService {
     let observation;
     try {
       observation = await this.backend.status();
+      const backendName = this.backendName();
+      const backendLabel = backendName === 'playwright' ? 'Playwright' : 'Ego Lite';
       checks.push({
-        name: 'ego-lite',
+        name: backendName,
         status: observation.connected ? 'pass' : 'fail',
-        message: observation.connected ? 'Ego Lite 已连接。' : 'Ego Lite 未连接。',
+        message: observation.connected ? `${backendLabel} 已连接。` : `${backendLabel} 未连接。`,
       });
       if (!observation.connected) return { ok: false, checks };
     } catch (error) {
-      checks.push({ name: 'ego-lite', status: 'fail', message: `Ego Lite 检查失败：${error instanceof Error ? error.message : String(error)}` });
+      const backendName = this.backendName();
+      const backendLabel = backendName === 'playwright' ? 'Playwright' : 'Ego Lite';
+      checks.push({ name: backendName, status: 'fail', message: `${backendLabel} 检查失败：${error instanceof Error ? error.message : String(error)}` });
       return { ok: false, checks };
     }
 
@@ -437,7 +460,8 @@ export class OutlookService {
     }
     const state = detectOutlookState(url, observation.snapshot);
     if (state === 'AUTH_REQUIRED') {
-      checks.push({ name: 'authentication', status: 'fail', message: 'Outlook 尚未登录；请在 Ego Lite 中登录后重试。' });
+      const location = this.backendName() === 'playwright' ? 'Playwright 浏览器' : 'Ego Lite';
+      checks.push({ name: 'authentication', status: 'fail', message: `Outlook 尚未登录；请在${location}中登录后重试。` });
       return { ok: false, checks };
     }
     checks.push({ name: 'authentication', status: 'pass', message: `Outlook 已登录，当前状态：${state}。` });
@@ -460,7 +484,7 @@ export class OutlookService {
     const observation = await this.backend.inspect();
     const url = await this.requireAuthenticatedPage(observation.page, observation.snapshot);
     return {
-      backend: 'ego-lite',
+      backend: this.backendName(),
       capturedAt: new Date().toISOString(),
       state: detectOutlookState(url, observation.snapshot),
       ...observation,
@@ -471,7 +495,7 @@ export class OutlookService {
     const observation = await this.backend.inspectMessage();
     const url = await this.requireAuthenticatedPage(observation.page, observation.snapshot);
     return {
-      backend: 'ego-lite',
+      backend: this.backendName(),
       capturedAt: new Date().toISOString(),
       state: detectOutlookState(url, observation.snapshot),
       ...observation,
@@ -1196,5 +1220,9 @@ export class OutlookService {
       }
     }
     throw new AppError('OPERATION_FAILED', '批量导出超过 100 页，已停止以避免无限循环。');
+  }
+
+  async syncObsidian(options: DatedMailListOptions, outputDirectory: string): Promise<ObsidianSyncResult> {
+    return await syncObsidian(this, options, outputDirectory);
   }
 }

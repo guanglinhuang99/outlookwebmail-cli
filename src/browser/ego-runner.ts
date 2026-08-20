@@ -15,6 +15,11 @@ export interface EgoRunResult<T> {
   value: T;
 }
 
+export interface BrowserScriptRunner {
+  run<T>(body: string, timeoutMs?: number): Promise<EgoRunResult<T>>;
+  close?(): Promise<void>;
+}
+
 export interface EgoRunnerOptions {
   command?: string;
   args?: string[];
@@ -65,7 +70,7 @@ function stderrSuffix(stderr: string): string {
   return `：${value.slice(-1000)}`;
 }
 
-export class EgoRunner {
+export class EgoRunner implements BrowserScriptRunner {
   private readonly command: string;
   private readonly args: string[];
   private readonly maxOutputBytes: number;

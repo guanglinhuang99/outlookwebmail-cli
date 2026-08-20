@@ -309,3 +309,27 @@ export interface ObsidianExportResult {
   attachments: ExportedAttachment[];
   bytes: number;
 }
+
+export type ObsidianSyncStatus = 'created' | 'updated' | 'unchanged';
+
+export interface ObsidianSyncItem {
+  id: string;
+  stableId: string;
+  status: ObsidianSyncStatus;
+  markdownPath: string;
+  attachmentDirectory: string | null;
+  attachments: DownloadedAttachmentWithHash[];
+}
+
+export interface ObsidianSyncResult {
+  outputDirectory: string;
+  fromDate: string;
+  toDate: string;
+  directory: FolderSummary | null;
+  manifestPath: string;
+  attachmentIndexPath: string;
+  created: number;
+  updated: number;
+  unchanged: number;
+  items: ObsidianSyncItem[];
+}

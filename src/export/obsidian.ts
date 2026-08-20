@@ -1,5 +1,5 @@
 import { createHash, randomUUID } from 'node:crypto';
-import { access, mkdir, rename, writeFile } from 'node:fs/promises';
+import { access, mkdir, rename, unlink, writeFile } from 'node:fs/promises';
 import { basename, join, relative, resolve, sep } from 'node:path';
 import type { ExportedAttachment, MailAddress, MailMessage } from '../types/mail.js';
 import { AppError } from '../util/errors.js';
@@ -132,6 +132,27 @@ export function renderObsidianMarkdown(message: MailMessage, attachments: Export
 export async function writeMarkdownAtomically(path: string, markdown: string): Promise<number> {
   const temporaryPath = join(resolve(path, '..'), `.${basename(path)}.${randomUUID()}.tmp`);
   await writeFile(temporaryPath, markdown, { encoding: 'utf8', flag: 'wx' });
-  await rename(temporaryPath, path);
+  await replaceFileAtomically(temporaryPath, path);
   return Buffer.byteLength(markdown, 'utf8');
+}
+
+export async function replaceFileAtomically(temporaryPath: string, targetPath: string): Promise<void> {
+  try {
+    await rename(temporaryPath, targetPath);
+    return;
+  } catch (error) {
+    if (!['EEXIST', 'EPERM'].includes((error as NodeJS.ErrnoException).code ?? '') || !await exists(targetPath)) {
+      throw error;
+    }
+  }
+
+  const backupPath = join(resolve(targetPath, '..'), `.${basename(targetPath)}.${randomUUID()}.bak`);
+  await rename(targetPath, backupPath);
+  try {
+    await rename(temporaryPath, targetPath);
+    await unlink(backupPath);
+  } catch (error) {
+    await rename(backupPath, targetPath).catch(() => undefined);
+    throw error;
+  }
 }
