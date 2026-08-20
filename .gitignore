@@ -1,0 +1,12 @@
+node_modules/
+dist/
+coverage/
+downloads/
+.codex-handoff/
+.webmail-cli/
+.env
+.env.*
+*.session.json
+.DS_Store
+outlook-*-inspect.json
+*.inspect.json
