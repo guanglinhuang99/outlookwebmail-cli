@@ -21,11 +21,28 @@ export interface BrowserStatus {
   snapshot: string;
 }
 
+export interface LoginHandoffResult {
+  taskSpaceId: string | number | null;
+  url: string | null;
+  handedOff: boolean;
+}
+
 export interface StatusResult {
   backend: 'ego-lite';
   url: string;
   title: string | null;
   state: OutlookState;
+}
+
+export interface DoctorCheck {
+  name: 'node' | 'ego-lite' | 'authentication' | 'dom';
+  status: 'pass' | 'warn' | 'fail';
+  message: string;
+}
+
+export interface DoctorResult {
+  ok: boolean;
+  checks: DoctorCheck[];
 }
 
 export interface InspectResult {

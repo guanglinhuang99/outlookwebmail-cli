@@ -1,27 +1,40 @@
-import { mkdir } from 'node:fs/promises';
-import { resolve } from 'node:path';
+import { createHash } from 'node:crypto';
+import { constants, createReadStream } from 'node:fs';
+import { copyFile, mkdir, mkdtemp, rm, stat, unlink } from 'node:fs/promises';
+import { basename, extname, join, resolve } from 'node:path';
 import type { BrowserBackend } from '../browser/backend.js';
 import type {
   AttachmentDownloadResult,
   AttachmentSummary,
+  ComposeActionResult,
+  ComposeOptions,
+  ComposeResult,
+  ConversationResult,
+  DownloadAllResult,
+  DraftMessage,
+  DraftUpdateOptions,
   FolderSummary,
+  ForwardOptions,
+  ForwardResult,
   MailMessage,
   MailSummary,
   MessageActionResult,
   MessageLocator,
+  MessageStateActionResult,
   ObsidianExportResult,
   RawMessageRow,
   ReplyActionResult,
   ReplyResult,
 } from '../types/mail.js';
-import type { InspectResult, MessageInspectResult, StatusResult } from '../types/inspect.js';
+import type { DoctorCheck, DoctorResult, InspectResult, MessageInspectResult, StatusResult } from '../types/inspect.js';
 import { AppError } from '../util/errors.js';
-import { messageFingerprint } from '../util/text.js';
+import { messageFingerprint, normalizeText, stableMessageId } from '../util/text.js';
 import { EgoInboxParser, type InboxParser } from './inbox-parser.js';
 import { EgoMessageParser, type MessageParser } from './message-parser.js';
 import { FolderParser } from './folder-parser.js';
 import { SessionStore } from '../session/session-store.js';
 import { detectOutlookState } from './state.js';
+import { MutationStore } from '../safety/mutation-store.js';
 import {
   attachmentLink,
   chooseExportPaths,
@@ -38,10 +51,27 @@ const SEARCH_STATE_SCRIPT = String.raw`
   return { count: inputs.length, value: inputs.length === 1 ? inputs[0].value : null };
 })()
 `;
+const DOCTOR_DOM_SCRIPT = String.raw`
+(() => {
+  const searchInputs = Array.from(document.querySelectorAll('input[role="combobox"]'))
+    .filter(el => /搜索|search/i.test((el.getAttribute('aria-label') || '') + ' ' + (el.getAttribute('placeholder') || '')));
+  const mailLists = Array.from(document.querySelectorAll('[role="listbox"]'))
+    .filter(el => /邮件列表|mail list/i.test(el.getAttribute('aria-label') || ''));
+  const readingPanes = Array.from(document.querySelectorAll('[role="main"]'))
+    .filter(el => /阅读窗格|reading pane/i.test(el.getAttribute('aria-label') || ''));
+  return { searchInputs: searchInputs.length, mailLists: mailLists.length, readingPanes: readingPanes.length };
+})()
+`;
 
 interface SearchState {
   count: number;
   value: string | null;
+}
+
+interface DoctorDomInventory {
+  searchInputs: number;
+  mailLists: number;
+  readingPanes: number;
 }
 
 export interface InboxOptions {
@@ -56,12 +86,30 @@ export interface MailListResult {
 }
 
 export interface DatedMailListResult extends MailListResult {
-  date: string;
+  date: string | null;
+  fromDate: string;
+  toDate: string;
+  nextCursor: string | null;
+  hasMore: boolean;
+  filters: {
+    sender: string | null;
+    subject: string | null;
+    unread: boolean;
+    hasAttachments: boolean;
+  };
 }
 
 export interface DatedMailListOptions {
   date?: string | null;
+  fromDate?: string | null;
+  toDate?: string | null;
   directory?: string | null;
+  limit?: number;
+  cursor?: string | null;
+  sender?: string | null;
+  subject?: string | null;
+  unread?: boolean;
+  hasAttachments?: boolean;
 }
 
 function currentShanghaiDate(): string {
@@ -70,31 +118,114 @@ function currentShanghaiDate(): string {
   }).format(new Date());
 }
 
-function normalizeMailDate(value?: string | null): string {
-  const normalized = value?.normalize('NFKC').trim() || currentShanghaiDate();
+function normalizeMailDate(value: string | null | undefined, option = '--date', defaultToday = true): string | null {
+  const normalized = value?.normalize('NFKC').trim() || (defaultToday ? currentShanghaiDate() : null);
+  if (!normalized) return null;
   const match = /^(\d{4})-(\d{2})-(\d{2})$/.exec(normalized);
-  if (!match) throw new AppError('INVALID_ARGUMENT', '--date 必须使用 YYYY-MM-DD 格式。');
+  if (!match) throw new AppError('INVALID_ARGUMENT', `${option} 必须使用 YYYY-MM-DD 格式。`);
   const year = Number(match[1]);
   const month = Number(match[2]);
   const day = Number(match[3]);
   const date = new Date(Date.UTC(year, month - 1, day));
   if (date.getUTCFullYear() !== year || date.getUTCMonth() !== month - 1 || date.getUTCDate() !== day) {
-    throw new AppError('INVALID_ARGUMENT', '--date 不是有效的日历日期。');
+    throw new AppError('INVALID_ARGUMENT', `${option} 不是有效的日历日期。`);
   }
   return normalized;
 }
 
-function requireReadyPage(page: { url?: string; dialog?: unknown }, snapshot: string): string {
+interface DateWindow {
+  date: string | null;
+  fromDate: string;
+  toDate: string;
+}
+
+function normalizeDateWindow(options: DatedMailListOptions): DateWindow {
+  const hasDate = Boolean(options.date?.normalize('NFKC').trim());
+  const hasRange = Boolean(options.fromDate?.normalize('NFKC').trim() || options.toDate?.normalize('NFKC').trim());
+  if (hasDate && hasRange) {
+    throw new AppError('INVALID_ARGUMENT', '--date 不能与 --from-date/--to-date 同时使用。');
+  }
+  if (hasRange) {
+    const fromDate = normalizeMailDate(options.fromDate, '--from-date', false);
+    const toDate = normalizeMailDate(options.toDate, '--to-date', false);
+    if (!fromDate || !toDate) throw new AppError('INVALID_ARGUMENT', '日期范围必须同时提供 --from-date 和 --to-date。');
+    if (fromDate > toDate) throw new AppError('INVALID_ARGUMENT', '--from-date 不能晚于 --to-date。');
+    return { date: null, fromDate, toDate };
+  }
+  const date = normalizeMailDate(options.date, '--date', true)!;
+  return { date, fromDate: date, toDate: date };
+}
+
+function validateMailId(id: string): void {
+  if (!/^\d+$/.test(id) && !/^m_[A-Za-z0-9_-]{20}$/.test(id)) {
+    throw new AppError('INVALID_ARGUMENT', '邮件 ID 必须是列表返回的数字短 ID 或 stableId。');
+  }
+}
+
+function encodeCursor(scope: string, offset: number): string {
+  return Buffer.from(JSON.stringify({ v: 1, scope, offset }), 'utf8').toString('base64url');
+}
+
+function decodeCursor(value: string | null | undefined, scope: string): number {
+  if (!value?.trim()) return 0;
+  try {
+    const parsed = JSON.parse(Buffer.from(value.trim(), 'base64url').toString('utf8')) as unknown;
+    if (!parsed || typeof parsed !== 'object') throw new Error('invalid cursor');
+    const cursor = parsed as { v?: unknown; scope?: unknown; offset?: unknown };
+    if (cursor.v !== 1 || cursor.scope !== scope || !Number.isInteger(cursor.offset) || Number(cursor.offset) < 0) {
+      throw new Error('invalid cursor');
+    }
+    return Number(cursor.offset);
+  } catch (error) {
+    throw new AppError('INVALID_ARGUMENT', '--cursor 无效或不属于当前目录和筛选条件。', { cause: error });
+  }
+}
+
+function normalizeRecipients(values: string[] | undefined): string[] {
+  const recipients = new Map<string, string>();
+  for (const value of values ?? []) {
+    const normalized = value.normalize('NFKC').trim();
+    const key = normalized.toLocaleLowerCase('en-US');
+    if (normalized && !recipients.has(key)) recipients.set(key, normalized);
+  }
+  return Array.from(recipients.values());
+}
+
+async function sha256File(path: string): Promise<string> {
+  return await new Promise<string>((resolveHash, rejectHash) => {
+    const hash = createHash('sha256');
+    const stream = createReadStream(path);
+    stream.on('error', rejectHash);
+    stream.on('data', chunk => hash.update(chunk));
+    stream.on('end', () => resolveHash(hash.digest('hex')));
+  });
+}
+
+async function copyWithoutOverwrite(source: string, directory: string, preferredFilename: string): Promise<{
+  filename: string; path: string;
+}> {
+  const extension = extname(preferredFilename);
+  const stem = basename(preferredFilename, extension) || 'attachment';
+  for (let suffix = 0; suffix < 10_000; suffix += 1) {
+    const filename = suffix === 0 ? `${stem}${extension}` : `${stem} (${suffix + 1})${extension}`;
+    const target = join(directory, filename);
+    try {
+      await copyFile(source, target, constants.COPYFILE_EXCL);
+      await unlink(source);
+      return { filename, path: target };
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code !== 'EEXIST') throw error;
+    }
+  }
+  throw new AppError('OPERATION_FAILED', `附件 ${preferredFilename} 的同名文件过多，无法生成安全文件名。`);
+}
+
+function requirePageUrl(page: { url?: string; dialog?: unknown }): string {
   if (page.dialog) {
     throw new AppError('OUTLOOK_NOT_READY', 'Outlook 页面存在未处理的浏览器对话框。');
   }
 
   const url = page.url ?? null;
-  const state = detectOutlookState(url, snapshot);
-  if (state === 'AUTH_REQUIRED') {
-    throw new AppError('AUTH_REQUIRED', '请在 Ego Lite 中重新登录 Outlook，然后再次执行命令。');
-  }
-
   if (!url) {
     throw new AppError('OUTLOOK_NOT_READY', '无法取得 Outlook 页面地址。');
   }
@@ -112,15 +243,89 @@ export class OutlookService {
     private readonly sessionStore = new SessionStore(),
     inboxParser?: InboxParser,
     messageParser?: MessageParser,
+    private readonly mutationStore = new MutationStore(),
   ) {
     this.inboxParser = inboxParser ?? new EgoInboxParser(backend);
     this.messageParser = messageParser ?? new EgoMessageParser(backend);
     this.folderParser = new FolderParser(backend);
   }
 
+  private locatorForRow(row: RawMessageRow): MessageLocator {
+    return {
+      subject: row.subject,
+      senderName: row.senderName,
+      senderAddress: row.senderAddress,
+      receivedAt: row.receivedAt,
+      receivedAtText: row.receivedAtText,
+      preview: row.preview,
+      hasAttachments: row.hasAttachments,
+    };
+  }
+
+  private summaryForRow(row: RawMessageRow, id: string): MailSummary {
+    return {
+      id,
+      stableId: stableMessageId(row),
+      sender: { name: row.senderName, address: row.senderAddress },
+      subject: row.subject,
+      receivedAt: row.receivedAt,
+      receivedAtText: row.receivedAtText,
+      preview: row.preview,
+      unread: row.unread,
+      hasAttachments: row.hasAttachments,
+    };
+  }
+
+  private async writeListSession(source: string, messages: MailSummary[], rows: RawMessageRow[]): Promise<void> {
+    const previous = await this.sessionStore.read();
+    const stableEntries = new Map(Object.entries(previous?.stableMessages ?? {}));
+    for (const row of rows) {
+      const stableId = stableMessageId(row);
+      stableEntries.delete(stableId);
+      stableEntries.set(stableId, this.locatorForRow(row));
+    }
+    while (stableEntries.size > 1_000) stableEntries.delete(stableEntries.keys().next().value!);
+    await this.sessionStore.write({
+      version: 1,
+      updatedAt: new Date().toISOString(),
+      source,
+      messages: Object.fromEntries(messages.map((message, index) => [message.id, this.locatorForRow(rows[index]!)])),
+      stableMessages: Object.fromEntries(stableEntries),
+    });
+  }
+
   private async ensureReady(): Promise<void> {
     const observation = await this.backend.status();
-    requireReadyPage(observation.page, observation.snapshot);
+    await this.requireAuthenticatedPage(observation.page, observation.snapshot);
+  }
+
+  private async requireAuthenticatedPage(
+    page: { url?: string; dialog?: unknown },
+    snapshot: string,
+  ): Promise<string> {
+    const url = requirePageUrl(page);
+    if (detectOutlookState(url, snapshot) !== 'AUTH_REQUIRED') return url;
+
+    try {
+      const handoff = await this.backend.handoffForLogin();
+      if (handoff.handedOff) {
+        throw new AppError(
+          'AUTH_REQUIRED',
+          '已在 Ego Lite 中打开 Outlook 并将页面交给你。请完成登录，再将控制权交还给 Agent，然后重新执行命令。',
+        );
+      }
+      throw new AppError(
+        'AUTH_REQUIRED',
+        '已在 Ego Lite 中打开 Outlook，但未能把页面控制权交给你；请打开 Ego Lite 完成登录后重试。',
+      );
+    } catch (error) {
+      if (error instanceof AppError && error.code === 'AUTH_REQUIRED') throw error;
+      throw new AppError(
+        'AUTH_REQUIRED',
+        'Outlook 尚未登录；已尝试在 Ego Lite 中打开登录页面，但控制权交接失败。请打开 Ego Lite 登录后重试。',
+        { cause: error },
+      );
+    }
   }
 
   private async searchState(): Promise<SearchState> {
@@ -166,31 +371,8 @@ export class OutlookService {
     const rawRows = await this.collectRows(collectionTarget, true);
     const selectedRows = (options.unreadOnly ? rawRows.filter(row => row.unread === true) : rawRows)
       .slice(0, options.limit);
-    const messages: MailSummary[] = selectedRows.map((row, index) => ({
-      id: String(index + 1),
-      sender: { name: row.senderName, address: row.senderAddress },
-      subject: row.subject,
-      receivedAt: row.receivedAt,
-      receivedAtText: row.receivedAtText,
-      preview: row.preview,
-      unread: row.unread,
-      hasAttachments: row.hasAttachments,
-    }));
-
-    await this.sessionStore.write({
-      version: 1,
-      updatedAt: new Date().toISOString(),
-      source,
-      messages: Object.fromEntries(messages.map(message => [message.id, {
-        subject: message.subject,
-        senderName: message.sender.name,
-        senderAddress: message.sender.address,
-        receivedAt: message.receivedAt,
-        receivedAtText: message.receivedAtText,
-        preview: message.preview,
-        hasAttachments: message.hasAttachments,
-      }])),
-    });
+    const messages = selectedRows.map((row, index) => this.summaryForRow(row, String(index + 1)));
+    await this.writeListSession(source, messages, selectedRows);
 
     return { directory, messages };
   }
@@ -214,7 +396,7 @@ export class OutlookService {
 
   async status(): Promise<StatusResult> {
     const observation = await this.backend.status();
-    const url = requireReadyPage(observation.page, observation.snapshot);
+    const url = await this.requireAuthenticatedPage(observation.page, observation.snapshot);
     return {
       backend: 'ego-lite',
       url,
@@ -223,9 +405,60 @@ export class OutlookService {
     };
   }
 
+  async doctor(): Promise<DoctorResult> {
+    const checks: DoctorCheck[] = [];
+    const nodeMajor = Number(process.versions.node.split('.')[0]);
+    checks.push({
+      name: 'node',
+      status: nodeMajor >= 24 ? 'pass' : 'fail',
+      message: nodeMajor >= 24 ? `Node.js ${process.versions.node} 满足 >=24。` : `Node.js ${process.versions.node} 低于要求的 24。`,
+    });
+
+    let observation;
+    try {
+      observation = await this.backend.status();
+      checks.push({
+        name: 'ego-lite',
+        status: observation.connected ? 'pass' : 'fail',
+        message: observation.connected ? 'Ego Lite 已连接。' : 'Ego Lite 未连接。',
+      });
+      if (!observation.connected) return { ok: false, checks };
+    } catch (error) {
+      checks.push({ name: 'ego-lite', status: 'fail', message: `Ego Lite 检查失败：${error instanceof Error ? error.message : String(error)}` });
+      return { ok: false, checks };
+    }
+
+    let url: string;
+    try {
+      url = requirePageUrl(observation.page);
+    } catch (error) {
+      checks.push({ name: 'authentication', status: 'fail', message: error instanceof Error ? error.message : String(error) });
+      return { ok: false, checks };
+    }
+    const state = detectOutlookState(url, observation.snapshot);
+    if (state === 'AUTH_REQUIRED') {
+      checks.push({ name: 'authentication', status: 'fail', message: 'Outlook 尚未登录；请在 Ego Lite 中登录后重试。' });
+      return { ok: false, checks };
+    }
+    checks.push({ name: 'authentication', status: 'pass', message: `Outlook 已登录，当前状态：${state}。` });
+
+    try {
+      const dom = await this.backend.eval<DoctorDomInventory>(DOCTOR_DOM_SCRIPT);
+      const valid = dom.searchInputs === 1;
+      checks.push({
+        name: 'dom',
+        status: valid ? (dom.mailLists > 0 ? 'pass' : 'warn') : 'fail',
+        message: `DOM：搜索框 ${dom.searchInputs}，邮件列表 ${dom.mailLists}，阅读窗格 ${dom.readingPanes}。`,
+      });
+    } catch (error) {
+      checks.push({ name: 'dom', status: 'fail', message: `DOM 检查失败：${error instanceof Error ? error.message : String(error)}` });
+    }
+    return { ok: checks.every(check => check.status !== 'fail'), checks };
+  }
+
   async inspect(): Promise<InspectResult> {
     const observation = await this.backend.inspect();
-    const url = requireReadyPage(observation.page, observation.snapshot);
+    const url = await this.requireAuthenticatedPage(observation.page, observation.snapshot);
     return {
       backend: 'ego-lite',
       capturedAt: new Date().toISOString(),
@@ -236,7 +469,7 @@ export class OutlookService {
 
   async inspectMessage(): Promise<MessageInspectResult> {
     const observation = await this.backend.inspectMessage();
-    const url = requireReadyPage(observation.page, observation.snapshot);
+    const url = await this.requireAuthenticatedPage(observation.page, observation.snapshot);
     return {
       backend: 'ego-lite',
       capturedAt: new Date().toISOString(),
@@ -262,19 +495,45 @@ export class OutlookService {
   }
 
   async listByDate(options: DatedMailListOptions = {}): Promise<DatedMailListResult> {
-    const targetDate = normalizeMailDate(options.date);
+    const window = normalizeDateWindow(options);
+    const limit = options.limit ?? 20;
+    if (!Number.isInteger(limit) || limit < 1 || limit > 100) {
+      throw new AppError('INVALID_ARGUMENT', '--limit 必须是 1 到 100 之间的整数。');
+    }
+    const sender = options.sender?.normalize('NFKC').trim() || null;
+    const subject = options.subject?.normalize('NFKC').trim() || null;
     await this.ensureReady();
     await this.clearSearch();
     const directory = await this.selectDirectory(options.directory);
-    const rowsByFingerprint = new Map<string, RawMessageRow>();
+    const scope = createHash('sha256').update(JSON.stringify({
+      directory: directory.path,
+      ...window,
+      sender: normalizeText(sender),
+      subject: normalizeText(subject),
+      unread: Boolean(options.unread),
+      hasAttachments: Boolean(options.hasAttachments),
+    })).digest('base64url').slice(0, 20);
+    const offset = decodeCursor(options.cursor, scope);
+    const target = offset + limit + 1;
+    const matchingRows = new Map<string, RawMessageRow>();
     let rows = await this.inboxParser.resetAndExtract();
     let previousPage = '';
     let complete = false;
     for (let attempt = 0; attempt < 100; attempt += 1) {
       for (const row of rows) {
-        if (row.receivedAt?.slice(0, 10) === targetDate) rowsByFingerprint.set(messageFingerprint(row), row);
+        const receivedDate = row.receivedAt?.slice(0, 10) ?? null;
+        if (!receivedDate || receivedDate < window.fromDate || receivedDate > window.toDate) continue;
+        if (sender && !normalizeText(row.senderAddress || row.senderName).includes(normalizeText(sender))) continue;
+        if (subject && !normalizeText(row.subject).includes(normalizeText(subject))) continue;
+        if (options.unread && row.unread !== true) continue;
+        if (options.hasAttachments && row.hasAttachments !== true) continue;
+        matchingRows.set(messageFingerprint(row), row);
       }
-      if (rows.some(row => row.receivedAt && row.receivedAt.slice(0, 10) < targetDate)) {
+      if (matchingRows.size >= target) {
+        complete = true;
+        break;
+      }
+      if (rows.some(row => row.receivedAt && row.receivedAt.slice(0, 10) < window.fromDate)) {
         complete = true;
         break;
       }
@@ -287,34 +546,27 @@ export class OutlookService {
       rows = await this.inboxParser.scrollAndExtract();
     }
     if (!complete) {
-      throw new AppError('OPERATION_FAILED', `${targetDate} 的邮件超过 100 个虚拟滚动页，已拒绝返回可能不完整的结果。`);
+      throw new AppError('OPERATION_FAILED', `${window.fromDate} 至 ${window.toDate} 的邮件超过 100 个虚拟滚动页，已拒绝返回可能不完整的结果。`);
     }
 
-    const messages: MailSummary[] = Array.from(rowsByFingerprint.values()).map((row, index) => ({
-      id: String(index + 1),
-      sender: { name: row.senderName, address: row.senderAddress },
-      subject: row.subject,
-      receivedAt: row.receivedAt,
-      receivedAtText: row.receivedAtText,
-      preview: row.preview,
-      unread: row.unread,
-      hasAttachments: row.hasAttachments,
-    }));
-    await this.sessionStore.write({
-      version: 1,
-      updatedAt: new Date().toISOString(),
-      source: `date:${directory.path}:${targetDate}`,
-      messages: Object.fromEntries(messages.map(message => [message.id, {
-        subject: message.subject,
-        senderName: message.sender.name,
-        senderAddress: message.sender.address,
-        receivedAt: message.receivedAt,
-        receivedAtText: message.receivedAtText,
-        preview: message.preview,
-        hasAttachments: message.hasAttachments,
-      }])),
-    });
-    return { date: targetDate, directory, messages };
+    const allRows = Array.from(matchingRows.values());
+    const selectedRows = allRows.slice(offset, offset + limit);
+    const hasMore = allRows.length > offset + limit;
+    const messages = selectedRows.map((row, index) => this.summaryForRow(row, String(offset + index + 1)));
+    const source = window.date
+      ? `date:${directory.path}:${window.date}`
+      : `range:${directory.path}:${window.fromDate}:${window.toDate}`;
+    await this.writeListSession(source, messages, selectedRows);
+    return {
+      date: window.date,
+      fromDate: window.fromDate,
+      toDate: window.toDate,
+      directory,
+      messages,
+      hasMore,
+      nextCursor: hasMore ? encodeCursor(scope, offset + limit) : null,
+      filters: { sender, subject, unread: Boolean(options.unread), hasAttachments: Boolean(options.hasAttachments) },
+    };
   }
 
   async today(directoryName?: string | null): Promise<DatedMailListResult> {
@@ -331,7 +583,7 @@ export class OutlookService {
     if (!session) {
       throw new AppError('INVALID_ARGUMENT', '当前没有邮件列表 Session；请先运行 list、today、inbox 或 search。');
     }
-    const message = session.messages[id];
+    const message = /^\d+$/.test(id) ? session.messages[id] : session.stableMessages?.[id];
     if (!message) {
       throw new AppError('INVALID_ARGUMENT', `Session 中不存在邮件 ID ${id}；请重新运行 list、today、inbox 或 search。`);
     }
@@ -339,7 +591,7 @@ export class OutlookService {
   }
 
   async read(id: string): Promise<MailMessage> {
-    if (!/^\d+$/.test(id)) throw new AppError('INVALID_ARGUMENT', '邮件 ID 必须是 list/today/inbox/search 返回的数字短 ID。');
+    validateMailId(id);
     await this.ensureReady();
     const locator = await this.sessionLocator(id);
     const result = await this.messageParser.openAndExtract(locator);
@@ -358,6 +610,7 @@ export class OutlookService {
 
     return {
       id,
+      stableId: stableMessageId(locator),
       subject: result.message.subject,
       from: { name: result.message.fromName, address: result.message.fromAddress },
       to: result.message.to,
@@ -402,32 +655,71 @@ export class OutlookService {
     }
   }
 
-  async delete(id: string, confirmed: boolean): Promise<{ id: string; deleted: true; verified: true; sessionInvalidated: true }> {
+  async delete(
+    id: string,
+    confirmed: boolean,
+    requestId?: string | null,
+  ): Promise<{ id: string; deleted: true; verified: true; sessionInvalidated: true; requestId: string; deduplicated: boolean }> {
     if (!confirmed) {
       throw new AppError('CONFIRMATION_REQUIRED', '删除邮件必须显式提供 --yes；邮件将移入“已删除邮件”。');
     }
-    if (!/^\d+$/.test(id)) throw new AppError('INVALID_ARGUMENT', '邮件 ID 必须是 list/today/inbox/search 返回的数字短 ID。');
-    await this.ensureReady();
-    const result = await this.backend.deleteMessage(await this.sessionLocator(id));
-    this.assertPerformed(id, result);
+    validateMailId(id);
+    const normalizedRequestId = this.mutationStore.validateRequestId(requestId);
+    const payloadHash = this.mutationStore.payloadHash('delete', { id });
+    const prior = await this.mutationStore.prior<Awaited<ReturnType<OutlookService['delete']>>>(
+      normalizedRequestId, 'delete', payloadHash, id,
+    );
+    if (prior) return { ...prior, deduplicated: true };
+    const locator = await this.sessionLocator(id);
+    const auditId = stableMessageId(locator);
+    await this.mutationStore.begin(normalizedRequestId, 'delete', payloadHash, auditId);
+    try {
+      await this.ensureReady();
+      const result = await this.backend.deleteMessage(locator);
+      this.assertPerformed(id, result);
+    } catch (error) {
+      const appError = error instanceof AppError ? error : new AppError('OPERATION_FAILED', '删除邮件失败。', { cause: error });
+      await this.mutationStore.fail(normalizedRequestId, appError.code, { action: 'delete', mailId: auditId });
+      throw error;
+    }
+    const response = { id, deleted: true as const, verified: true as const, sessionInvalidated: true as const, requestId: normalizedRequestId, deduplicated: false };
+    await this.mutationStore.succeed(normalizedRequestId, response, { action: 'delete', mailId: auditId });
     await this.sessionStore.clear();
-    return { id, deleted: true, verified: true, sessionInvalidated: true };
+    return response;
   }
 
   async move(
     id: string,
     folder: string,
     confirmed: boolean,
-  ): Promise<{ id: string; folder: string; moved: true; verified: true; sessionInvalidated: true }> {
+    requestId?: string | null,
+  ): Promise<{ id: string; folder: string; moved: true; verified: true; sessionInvalidated: true; requestId: string; deduplicated: boolean }> {
     if (!confirmed) throw new AppError('CONFIRMATION_REQUIRED', '移动邮件必须显式提供 --yes。');
-    if (!/^\d+$/.test(id)) throw new AppError('INVALID_ARGUMENT', '邮件 ID 必须是 list/today/inbox/search 返回的数字短 ID。');
+    validateMailId(id);
     const normalizedFolder = folder.normalize('NFKC').trim();
     if (!normalizedFolder) throw new AppError('INVALID_ARGUMENT', '目标目录不能为空。');
-    await this.ensureReady();
-    const result = await this.backend.moveMessage(await this.sessionLocator(id), normalizedFolder);
-    this.assertPerformed(id, result);
+    const normalizedRequestId = this.mutationStore.validateRequestId(requestId);
+    const payloadHash = this.mutationStore.payloadHash('move', { id, folder: normalizedFolder });
+    const prior = await this.mutationStore.prior<Awaited<ReturnType<OutlookService['move']>>>(
+      normalizedRequestId, 'move', payloadHash, id,
+    );
+    if (prior) return { ...prior, deduplicated: true };
+    const locator = await this.sessionLocator(id);
+    const auditId = stableMessageId(locator);
+    await this.mutationStore.begin(normalizedRequestId, 'move', payloadHash, auditId);
+    try {
+      await this.ensureReady();
+      const result = await this.backend.moveMessage(locator, normalizedFolder);
+      this.assertPerformed(id, result);
+    } catch (error) {
+      const appError = error instanceof AppError ? error : new AppError('OPERATION_FAILED', '移动邮件失败。', { cause: error });
+      await this.mutationStore.fail(normalizedRequestId, appError.code, { action: 'move', mailId: auditId });
+      throw error;
+    }
+    const response = { id, folder: normalizedFolder, moved: true as const, verified: true as const, sessionInvalidated: true as const, requestId: normalizedRequestId, deduplicated: false };
+    await this.mutationStore.succeed(normalizedRequestId, response, { action: 'move', mailId: auditId });
     await this.sessionStore.clear();
-    return { id, folder: normalizedFolder, moved: true, verified: true, sessionInvalidated: true };
+    return response;
   }
 
   private assertReplyPerformed(id: string, result: ReplyActionResult): void {
@@ -446,19 +738,154 @@ export class OutlookService {
     }
   }
 
+  private assertComposePerformed(result: ComposeActionResult, operation: string): void {
+    if ((result.matchCount && result.matchCount > 1) || result.status === 'message_ambiguous') {
+      throw new AppError('AMBIGUOUS_MESSAGE', `${operation}对应多个邮件候选，已拒绝继续。`);
+    }
+    if (result.status === 'message_not_found') throw new AppError('MESSAGE_NOT_FOUND', `${operation}的原邮件或草稿不存在。`);
+    if (!result.verified || !result.performed) {
+      throw new AppError('OPERATION_FAILED', `${operation}失败：${result.status}。`);
+    }
+  }
+
+  private async normalizeAttachmentPaths(paths: string[] | undefined): Promise<string[]> {
+    const normalized = Array.from(new Set((paths ?? []).map(path => resolve(path))));
+    for (const path of normalized) {
+      let info;
+      try {
+        info = await stat(path);
+      } catch (error) {
+        throw new AppError('INVALID_ARGUMENT', `附件文件不存在：${path}`, { cause: error });
+      }
+      if (!info.isFile()) throw new AppError('INVALID_ARGUMENT', `附件路径不是普通文件：${path}`);
+    }
+    return normalized;
+  }
+
+  async compose(options: ComposeOptions, requestId?: string | null): Promise<ComposeResult> {
+    const normalized: ComposeOptions = {
+      to: normalizeRecipients(options.to), cc: normalizeRecipients(options.cc), bcc: normalizeRecipients(options.bcc),
+      subject: options.subject.normalize('NFKC').trim(),
+      content: options.content,
+      attachments: await this.normalizeAttachmentPaths(options.attachments),
+      draft: options.draft,
+    };
+    if (!normalized.subject) throw new AppError('INVALID_ARGUMENT', '--subject 不能为空。');
+    if (!normalized.content.trim()) throw new AppError('INVALID_ARGUMENT', '--content 不能为空。');
+    if (!normalized.draft && normalized.to.length === 0) throw new AppError('INVALID_ARGUMENT', '自动发送新邮件时至少需要一个 --to。');
+    const normalizedRequestId = normalized.draft ? null : this.mutationStore.validateRequestId(requestId);
+    const payloadHash = normalizedRequestId ? this.mutationStore.payloadHash('compose-send', normalized) : null;
+    const auditId = `out_${createHash('sha256').update(JSON.stringify({ to: normalized.to, subject: normalized.subject })).digest('base64url').slice(0, 20)}`;
+    if (normalizedRequestId && payloadHash) {
+      const prior = await this.mutationStore.prior<ComposeResult>(normalizedRequestId, 'compose-send', payloadHash, auditId);
+      if (prior) return { ...prior, deduplicated: true };
+      await this.mutationStore.begin(normalizedRequestId, 'compose-send', payloadHash, auditId);
+    }
+    let result: ComposeActionResult;
+    try {
+      await this.ensureReady();
+      result = await this.backend.composeMessage(normalized);
+      this.assertComposePerformed(result, '新建邮件');
+    } catch (error) {
+      if (normalizedRequestId) {
+        const appError = error instanceof AppError ? error : new AppError('OPERATION_FAILED', '新建邮件失败。', { cause: error });
+        await this.mutationStore.fail(normalizedRequestId, appError.code, { action: 'compose-send', mailId: auditId });
+      }
+      throw error;
+    }
+    const response: ComposeResult = normalized.draft ? {
+      draft: true, sent: false, requiresManualSend: true, handedOff: result.handedOff,
+      verified: true, attachmentCount: result.attachmentCount,
+    } : {
+      draft: false, sent: true, requiresManualSend: false, handedOff: false,
+      verified: true, attachmentCount: result.attachmentCount,
+      requestId: normalizedRequestId!, deduplicated: false,
+    };
+    if (normalizedRequestId) await this.mutationStore.succeed(normalizedRequestId, response, { action: 'compose-send', mailId: auditId });
+    return response;
+  }
+
+  async forward(
+    id: string,
+    options: ForwardOptions,
+    requestId?: string | null,
+  ): Promise<ForwardResult> {
+    validateMailId(id);
+    const normalized: ForwardOptions = {
+      to: normalizeRecipients(options.to), cc: normalizeRecipients(options.cc), bcc: normalizeRecipients(options.bcc),
+      content: options.content,
+      attachments: await this.normalizeAttachmentPaths(options.attachments),
+      draft: options.draft,
+    };
+    if (!normalized.content.trim()) throw new AppError('INVALID_ARGUMENT', '--content 不能为空。');
+    if (!normalized.draft && normalized.to.length === 0) throw new AppError('INVALID_ARGUMENT', '自动转发时至少需要一个 --to。');
+    const normalizedRequestId = normalized.draft ? null : this.mutationStore.validateRequestId(requestId);
+    const payloadHash = normalizedRequestId ? this.mutationStore.payloadHash('forward-send', { id, ...normalized }) : null;
+    if (normalizedRequestId && payloadHash) {
+      const prior = await this.mutationStore.prior<ForwardResult>(normalizedRequestId, 'forward-send', payloadHash, id);
+      if (prior) return { ...prior, deduplicated: true };
+    }
+    const locator = await this.sessionLocator(id);
+    const auditId = stableMessageId(locator);
+    if (normalizedRequestId && payloadHash) await this.mutationStore.begin(normalizedRequestId, 'forward-send', payloadHash, auditId);
+    let result: ComposeActionResult;
+    try {
+      await this.ensureReady();
+      result = await this.backend.forwardMessage(locator, normalized);
+      this.assertComposePerformed(result, '转发邮件');
+    } catch (error) {
+      if (normalizedRequestId) {
+        const appError = error instanceof AppError ? error : new AppError('OPERATION_FAILED', '转发邮件失败。', { cause: error });
+        await this.mutationStore.fail(normalizedRequestId, appError.code, { action: 'forward-send', mailId: auditId });
+      }
+      throw error;
+    }
+    const response: ForwardResult = normalized.draft ? {
+      id, draft: true, sent: false, requiresManualSend: true, handedOff: result.handedOff,
+      verified: true, attachmentCount: result.attachmentCount, originalAttachmentsPreserved: true,
+    } : {
+      id, draft: false, sent: true, requiresManualSend: false, handedOff: false,
+      verified: true, attachmentCount: result.attachmentCount, originalAttachmentsPreserved: true,
+      requestId: normalizedRequestId!, deduplicated: false,
+    };
+    if (normalizedRequestId) await this.mutationStore.succeed(normalizedRequestId, response, { action: 'forward-send', mailId: auditId });
+    return response;
+  }
+
   async reply(
     id: string,
     content: string,
     draft = true,
     replyAll = false,
+    requestId?: string | null,
   ): Promise<ReplyResult> {
-    if (!/^\d+$/.test(id)) {
-      throw new AppError('INVALID_ARGUMENT', '邮件 ID 必须是 list/today/inbox/search 返回的数字短 ID。');
-    }
+    validateMailId(id);
     if (!content.trim()) throw new AppError('INVALID_ARGUMENT', '--content 不能为空。');
-    await this.ensureReady();
-    const result = await this.backend.replyMessage(await this.sessionLocator(id), content, draft, replyAll);
-    this.assertReplyPerformed(id, result);
+    const normalizedRequestId = draft ? null : this.mutationStore.validateRequestId(requestId);
+    const payloadHash = normalizedRequestId
+      ? this.mutationStore.payloadHash('reply-send', { id, content, replyAll })
+      : null;
+    if (normalizedRequestId && payloadHash) {
+      const prior = await this.mutationStore.prior<ReplyResult>(normalizedRequestId, 'reply-send', payloadHash, id);
+      if (prior) return { ...prior, deduplicated: true };
+    }
+    const locator = await this.sessionLocator(id);
+    const auditId = stableMessageId(locator);
+    if (normalizedRequestId && payloadHash) {
+      await this.mutationStore.begin(normalizedRequestId, 'reply-send', payloadHash, auditId);
+    }
+    let result: ReplyActionResult;
+    try {
+      await this.ensureReady();
+      result = await this.backend.replyMessage(locator, content, draft, replyAll);
+      this.assertReplyPerformed(id, result);
+    } catch (error) {
+      if (normalizedRequestId) {
+        const appError = error instanceof AppError ? error : new AppError('OPERATION_FAILED', '发送回复失败。', { cause: error });
+        await this.mutationStore.fail(normalizedRequestId, appError.code, { action: 'reply-send', mailId: auditId });
+      }
+      throw error;
+    }
 
     if (draft) {
       if (result.status !== 'draft_ready' || !result.performed || !result.handedOff) {
@@ -478,7 +905,7 @@ export class OutlookService {
     if (result.status !== 'sent' || !result.performed) {
       throw new AppError('OPERATION_FAILED', 'Outlook 未能验证回复已经发送。');
     }
-    return {
+    const response: ReplyResult = {
       id,
       draft: false,
       replyAll,
@@ -486,6 +913,175 @@ export class OutlookService {
       requiresManualSend: false,
       handedOff: false,
       verified: true,
+      requestId: normalizedRequestId!,
+      deduplicated: false,
+    };
+    await this.mutationStore.succeed(normalizedRequestId!, response, { action: 'reply-send', mailId: auditId });
+    return response;
+  }
+
+  async drafts(options: { limit: number }): Promise<MailListResult> {
+    await this.ensureReady();
+    await this.clearSearch();
+    const directory = await this.backend.selectSystemFolder('草稿');
+    if (directory.count !== 1 || !directory.selected || !directory.folder) {
+      throw new AppError('FOLDER_NOT_FOUND', '无法选择 Outlook 草稿目录。');
+    }
+    return await this.list('system:草稿', { limit: options.limit }, directory.folder);
+  }
+
+  async readDraft(id: string): Promise<DraftMessage> {
+    validateMailId(id);
+    const locator = await this.sessionLocator(id);
+    await this.ensureReady();
+    const opened = await this.backend.openDraft(locator, true);
+    if (opened.matchCount > 1) throw new AppError('AMBIGUOUS_MESSAGE', `草稿 ID ${id} 对应多个候选。`);
+    if (opened.matchCount !== 1 || !opened.draft) throw new AppError('MESSAGE_NOT_FOUND', `无法定位草稿 ID ${id}。`);
+    return {
+      id, stableId: stableMessageId(locator),
+      to: opened.draft.to, cc: opened.draft.cc, bcc: opened.draft.bcc,
+      subject: opened.draft.subject, bodyText: opened.draft.bodyText,
+      attachments: opened.draft.attachments.map((attachment, index) => ({ id: String(index + 1), ...attachment })),
+    };
+  }
+
+  async updateDraft(id: string, options: DraftUpdateOptions): Promise<{
+    id: string; updated: true; verified: true; sessionInvalidated: true; attachmentCount: number;
+  }> {
+    validateMailId(id);
+    if (options.to === undefined && options.cc === undefined && options.bcc === undefined
+      && options.subject === undefined && options.content === undefined && options.attachments.length === 0) {
+      throw new AppError('INVALID_ARGUMENT', 'draft-update 至少需要一个要修改的字段或附件。');
+    }
+    const normalized: DraftUpdateOptions = {
+      to: options.to === undefined ? undefined : normalizeRecipients(options.to),
+      cc: options.cc === undefined ? undefined : normalizeRecipients(options.cc),
+      bcc: options.bcc === undefined ? undefined : normalizeRecipients(options.bcc),
+      subject: options.subject?.normalize('NFKC').trim(),
+      content: options.content,
+      attachments: await this.normalizeAttachmentPaths(options.attachments),
+    };
+    const locator = await this.sessionLocator(id);
+    await this.ensureReady();
+    const result = await this.backend.updateDraft(locator, normalized);
+    this.assertComposePerformed(result, '修改草稿');
+    await this.sessionStore.clear();
+    return { id, updated: true, verified: true, sessionInvalidated: true, attachmentCount: result.attachmentCount };
+  }
+
+  async sendDraft(id: string, requestId?: string | null): Promise<{
+    id: string; sent: true; verified: true; sessionInvalidated: true; requestId: string; deduplicated: boolean;
+  }> {
+    validateMailId(id);
+    const normalizedRequestId = this.mutationStore.validateRequestId(requestId);
+    const payloadHash = this.mutationStore.payloadHash('draft-send', { id });
+    const prior = await this.mutationStore.prior<Awaited<ReturnType<OutlookService['sendDraft']>>>(normalizedRequestId, 'draft-send', payloadHash, id);
+    if (prior) return { ...prior, deduplicated: true };
+    const locator = await this.sessionLocator(id);
+    const auditId = stableMessageId(locator);
+    await this.mutationStore.begin(normalizedRequestId, 'draft-send', payloadHash, auditId);
+    try {
+      await this.ensureReady();
+      const result = await this.backend.sendDraft(locator);
+      this.assertComposePerformed(result, '发送草稿');
+    } catch (error) {
+      const appError = error instanceof AppError ? error : new AppError('OPERATION_FAILED', '发送草稿失败。', { cause: error });
+      await this.mutationStore.fail(normalizedRequestId, appError.code, { action: 'draft-send', mailId: auditId });
+      throw error;
+    }
+    const response = { id, sent: true as const, verified: true as const, sessionInvalidated: true as const, requestId: normalizedRequestId, deduplicated: false };
+    await this.mutationStore.succeed(normalizedRequestId, response, { action: 'draft-send', mailId: auditId });
+    await this.sessionStore.clear();
+    return response;
+  }
+
+  async discardDraft(id: string, confirmed: boolean, requestId?: string | null): Promise<{
+    id: string; discarded: true; verified: true; sessionInvalidated: true; requestId: string; deduplicated: boolean;
+  }> {
+    if (!confirmed) throw new AppError('CONFIRMATION_REQUIRED', '放弃草稿必须显式提供 --yes。');
+    validateMailId(id);
+    const normalizedRequestId = this.mutationStore.validateRequestId(requestId);
+    const payloadHash = this.mutationStore.payloadHash('draft-discard', { id });
+    const prior = await this.mutationStore.prior<Awaited<ReturnType<OutlookService['discardDraft']>>>(normalizedRequestId, 'draft-discard', payloadHash, id);
+    if (prior) return { ...prior, deduplicated: true };
+    const locator = await this.sessionLocator(id);
+    const auditId = stableMessageId(locator);
+    await this.mutationStore.begin(normalizedRequestId, 'draft-discard', payloadHash, auditId);
+    try {
+      await this.ensureReady();
+      const result = await this.backend.discardDraft(locator);
+      this.assertPerformed(id, result);
+    } catch (error) {
+      const appError = error instanceof AppError ? error : new AppError('OPERATION_FAILED', '放弃草稿失败。', { cause: error });
+      await this.mutationStore.fail(normalizedRequestId, appError.code, { action: 'draft-discard', mailId: auditId });
+      throw error;
+    }
+    const response = { id, discarded: true as const, verified: true as const, sessionInvalidated: true as const, requestId: normalizedRequestId, deduplicated: false };
+    await this.mutationStore.succeed(normalizedRequestId, response, { action: 'draft-discard', mailId: auditId });
+    await this.sessionStore.clear();
+    return response;
+  }
+
+  private assertStatePerformed(id: string, result: MessageStateActionResult): void {
+    this.assertPerformed(id, result);
+  }
+
+  async markRead(id: string, unread: boolean): Promise<{ id: string; unread: boolean; changed: boolean; verified: true }> {
+    validateMailId(id);
+    await this.ensureReady();
+    const result = await this.backend.setReadState(await this.sessionLocator(id), unread);
+    this.assertStatePerformed(id, result);
+    return { id, unread, changed: Boolean(result.changed), verified: true };
+  }
+
+  async flag(id: string, flagged: boolean): Promise<{ id: string; flagged: boolean; changed: boolean; verified: true }> {
+    validateMailId(id);
+    await this.ensureReady();
+    const result = await this.backend.setFlagState(await this.sessionLocator(id), flagged);
+    this.assertStatePerformed(id, result);
+    return { id, flagged, changed: Boolean(result.changed), verified: true };
+  }
+
+  async categorize(id: string, category: string, applied: boolean): Promise<{
+    id: string; category: string; applied: boolean; changed: boolean; verified: true;
+  }> {
+    validateMailId(id);
+    const normalizedCategory = category.normalize('NFKC').trim();
+    if (!normalizedCategory) throw new AppError('INVALID_ARGUMENT', '--category 不能为空。');
+    await this.ensureReady();
+    const result = await this.backend.setCategoryState(await this.sessionLocator(id), normalizedCategory, applied);
+    this.assertStatePerformed(id, result);
+    return { id, category: normalizedCategory, applied, changed: Boolean(result.changed), verified: true };
+  }
+
+  async archive(id: string, confirmed: boolean, requestId?: string | null): Promise<{
+    id: string; archived: true; verified: true; sessionInvalidated: true; requestId: string; deduplicated: boolean;
+  }> {
+    const moved = await this.move(id, '存档', confirmed, requestId);
+    return {
+      id: moved.id, archived: true, verified: true, sessionInvalidated: true,
+      requestId: moved.requestId, deduplicated: moved.deduplicated,
+    };
+  }
+
+  async conversation(id: string): Promise<ConversationResult> {
+    validateMailId(id);
+    const locator = await this.sessionLocator(id);
+    await this.ensureReady();
+    const result = await this.backend.getConversation(locator);
+    if (result.matchCount > 1) throw new AppError('AMBIGUOUS_MESSAGE', `邮件 ID ${id} 对应多个候选。`);
+    if (result.matchCount !== 1 || result.messages.length === 0) throw new AppError('MESSAGE_NOT_FOUND', `无法读取邮件 ID ${id} 的会话。`);
+    return {
+      id, stableId: stableMessageId(locator), subject: locator.subject, complete: result.complete,
+      messages: result.messages.map((message, index) => ({
+        index: index + 1,
+        subject: message.subject,
+        from: { name: message.fromName, address: message.fromAddress },
+        to: message.to, cc: message.cc,
+        receivedAt: message.receivedAt, receivedAtText: message.receivedAtText,
+        bodyText: message.bodyText,
+        attachments: message.attachments.map((attachment, attachmentIndex) => ({ id: String(attachmentIndex + 1), ...attachment })),
+      })),
     };
   }
 
@@ -494,7 +1090,7 @@ export class OutlookService {
     attachmentId: string,
     outputDirectory: string,
   ): Promise<AttachmentDownloadResult> {
-    if (!/^\d+$/.test(id)) throw new AppError('INVALID_ARGUMENT', '邮件 ID 必须是 list/today/inbox/search 返回的数字短 ID。');
+    validateMailId(id);
     if (!/^[1-9]\d*$/.test(attachmentId)) throw new AppError('INVALID_ARGUMENT', '附件 ID 必须是 attachments/read 返回的正整数。');
     const directory = resolve(outputDirectory);
     await mkdir(directory, { recursive: true });
@@ -506,6 +1102,34 @@ export class OutlookService {
     );
     this.assertPerformed(id, result);
     return result;
+  }
+
+  async downloadAll(id: string, outputDirectory: string): Promise<DownloadAllResult> {
+    validateMailId(id);
+    const directory = resolve(outputDirectory);
+    await mkdir(directory, { recursive: true });
+    const stagingDirectory = await mkdtemp(join(directory, '.webmail-download-'));
+    try {
+      const message = await this.read(id);
+      const attachments = [];
+      for (const attachment of message.attachments) {
+        const downloaded = await this.downloadAttachment(id, attachment.id, stagingDirectory);
+        if (!downloaded.path || !downloaded.filename || downloaded.bytes === undefined) {
+          throw new AppError('OPERATION_FAILED', `附件 ${attachment.id} 下载结果缺少文件信息。`);
+        }
+        const saved = await copyWithoutOverwrite(downloaded.path, directory, downloaded.filename);
+        attachments.push({
+          id: attachment.id,
+          filename: saved.filename,
+          path: saved.path,
+          bytes: downloaded.bytes,
+          sha256: await sha256File(saved.path),
+        });
+      }
+      return { id, outputDirectory: directory, attachments };
+    } finally {
+      await rm(stagingDirectory, { recursive: true, force: true });
+    }
   }
 
   async exportObsidian(id: string, outputDirectory: string): Promise<ObsidianExportResult> {
@@ -541,5 +1165,36 @@ export class OutlookService {
       attachments,
       bytes,
     };
+  }
+
+  async exportBatch(options: DatedMailListOptions, outputDirectory: string): Promise<{
+    outputDirectory: string;
+    fromDate: string;
+    toDate: string;
+    directory: FolderSummary | null;
+    exports: ObsidianExportResult[];
+  }> {
+    if (!outputDirectory.normalize('NFKC').trim()) throw new AppError('INVALID_ARGUMENT', '导出目录不能为空。');
+    const directory = resolve(outputDirectory);
+    await mkdir(directory, { recursive: true });
+    const exports: ObsidianExportResult[] = [];
+    let cursor: string | null = null;
+    let first: DatedMailListResult | null = null;
+    for (let page = 0; page < 100; page += 1) {
+      const result = await this.listByDate({ ...options, limit: options.limit ?? 20, cursor });
+      first ??= result;
+      for (const message of result.messages) exports.push(await this.exportObsidian(message.stableId, directory));
+      cursor = result.nextCursor;
+      if (!cursor) {
+        return {
+          outputDirectory: directory,
+          fromDate: first.fromDate,
+          toDate: first.toDate,
+          directory: first.directory,
+          exports,
+        };
+      }
+    }
+    throw new AppError('OPERATION_FAILED', '批量导出超过 100 页，已停止以避免无限循环。');
   }
 }

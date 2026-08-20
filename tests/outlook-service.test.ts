@@ -1,3 +1,4 @@
+import { createHash } from 'node:crypto';
 import { mkdtemp, readFile, rm, stat, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
@@ -7,6 +8,7 @@ import type { InboxParser } from '../src/outlook/inbox-parser.js';
 import type { MessageParser } from '../src/outlook/message-parser.js';
 import { OutlookService } from '../src/outlook/service.js';
 import { SessionStore } from '../src/session/session-store.js';
+import { MutationStore } from '../src/safety/mutation-store.js';
 import type { RawMessageRow } from '../src/types/mail.js';
 
 const temporaryDirectories: string[] = [];
@@ -25,6 +27,11 @@ function createBackend(searchValue = ''): BrowserBackend {
       title: 'Outlook',
       page: { url: 'https://partner.outlook.cn/mail/', title: 'Outlook' },
       snapshot: '收件箱',
+    }),
+    handoffForLogin: vi.fn().mockResolvedValue({
+      taskSpaceId: 1,
+      url: 'https://partner.outlook.cn/mail/',
+      handedOff: true,
     }),
     eval: vi.fn().mockResolvedValue({ count: 1, value: searchValue }),
     clickAndWait: vi.fn().mockResolvedValue(undefined),
@@ -55,6 +62,54 @@ function createBackend(searchValue = ''): BrowserBackend {
     replyMessage: vi.fn().mockResolvedValue({
       matchCount: 1, status: 'draft_ready', performed: true, verified: true,
       draft: true, replyAll: false, handedOff: true,
+    }),
+    composeMessage: vi.fn().mockResolvedValue({
+      status: 'draft_ready', performed: true, verified: true, draft: true,
+      handedOff: true, attachmentCount: 0,
+    }),
+    forwardMessage: vi.fn().mockResolvedValue({
+      matchCount: 1, status: 'draft_ready', performed: true, verified: true,
+      draft: true, handedOff: true, attachmentCount: 0,
+    }),
+    selectSystemFolder: vi.fn().mockResolvedValue({
+      count: 1, selected: true,
+      folder: { name: '草稿', path: '草稿', level: 2, expanded: null },
+    }),
+    openDraft: vi.fn().mockResolvedValue({
+      matchCount: 1,
+      closed: true,
+      draft: {
+        to: [{ name: null, address: 'to@example.com' }], cc: [], bcc: [],
+        subject: '草稿主题', bodyText: '草稿正文', attachments: [],
+      },
+    }),
+    updateDraft: vi.fn().mockResolvedValue({
+      matchCount: 1, status: 'draft_ready', performed: true, verified: true,
+      draft: true, handedOff: false, attachmentCount: 0,
+    }),
+    sendDraft: vi.fn().mockResolvedValue({
+      matchCount: 1, status: 'sent', performed: true, verified: true,
+      draft: false, handedOff: false, attachmentCount: 0,
+    }),
+    discardDraft: vi.fn().mockResolvedValue({
+      matchCount: 1, status: 'performed', performed: true, verified: true,
+    }),
+    setReadState: vi.fn().mockResolvedValue({
+      matchCount: 1, status: 'performed', performed: true, verified: true, changed: true,
+    }),
+    setFlagState: vi.fn().mockResolvedValue({
+      matchCount: 1, status: 'performed', performed: true, verified: true, changed: true,
+    }),
+    setCategoryState: vi.fn().mockResolvedValue({
+      matchCount: 1, status: 'performed', performed: true, verified: true, changed: true,
+    }),
+    getConversation: vi.fn().mockResolvedValue({
+      matchCount: 1, complete: true,
+      messages: [{
+        subject: '测试主题', fromName: '张三', fromAddress: 'zhangsan@example.com',
+        to: [], cc: [], receivedAt: null, receivedAtText: null,
+        bodyText: '会话正文', attachments: [],
+      }],
     }),
     downloadAttachment: vi.fn().mockResolvedValue({
       matchCount: 1, status: 'performed', performed: true, verified: true,
@@ -100,6 +155,7 @@ async function createService(searchValue = ''): Promise<{
   backend: BrowserBackend;
   parser: InboxParser;
   store: SessionStore;
+  mutationStore: MutationStore;
   service: OutlookService;
 }> {
   const directory = await mkdtemp(join(tmpdir(), 'webmail-service-test-'));
@@ -107,10 +163,54 @@ async function createService(searchValue = ''): Promise<{
   const backend = createBackend(searchValue);
   const parser = createParser(rows);
   const store = new SessionStore(join(directory, 'session.json'));
-  return { backend, parser, store, service: new OutlookService(backend, store, parser) };
+  const mutationStore = new MutationStore(join(directory, 'mutations.json'), join(directory, 'audit.jsonl'));
+  return { backend, parser, store, mutationStore, service: new OutlookService(backend, store, parser, undefined, mutationStore) };
 }
 
 describe('OutlookService mail listing', () => {
+  it('returns status without handing off when Outlook is already signed in', async () => {
+    const { service, backend } = await createService();
+
+    await expect(service.status()).resolves.toMatchObject({ state: 'INBOX' });
+    expect(backend.handoffForLogin).not.toHaveBeenCalled();
+  });
+
+  it('opens and hands off Outlook when authentication is required', async () => {
+    const { service, backend } = await createService();
+    vi.mocked(backend.status).mockResolvedValueOnce({
+      connected: true,
+      taskSpaceId: 1,
+      url: 'https://login.partner.microsoftonline.cn/',
+      title: 'Sign in',
+      page: { url: 'https://login.partner.microsoftonline.cn/', title: 'Sign in' },
+      snapshot: 'Sign in Password',
+    });
+
+    await expect(service.status()).rejects.toMatchObject({
+      code: 'AUTH_REQUIRED',
+      message: expect.stringContaining('将页面交给你'),
+    });
+    expect(backend.handoffForLogin).toHaveBeenCalledOnce();
+  });
+
+  it('keeps AUTH_REQUIRED when login handoff itself fails', async () => {
+    const { service, backend } = await createService();
+    vi.mocked(backend.status).mockResolvedValueOnce({
+      connected: true,
+      taskSpaceId: 1,
+      url: 'https://login.partner.microsoftonline.cn/',
+      title: 'Sign in',
+      page: { url: 'https://login.partner.microsoftonline.cn/', title: 'Sign in' },
+      snapshot: '登录 密码',
+    });
+    vi.mocked(backend.handoffForLogin).mockRejectedValueOnce(new Error('handoff unavailable'));
+
+    await expect(service.status()).rejects.toMatchObject({
+      code: 'AUTH_REQUIRED',
+      message: expect.stringContaining('控制权交接失败'),
+    });
+  });
+
   it('lists every message received today and writes a today session', async () => {
     vi.useFakeTimers();
     vi.setSystemTime(new Date('2026-08-20T02:00:00.000Z'));
@@ -177,6 +277,44 @@ describe('OutlookService mail listing', () => {
     expect(backend.status).not.toHaveBeenCalled();
   });
 
+  it('paginates a filtered date range with an opaque cursor and absolute short IDs', async () => {
+    const { service, parser } = await createService();
+    const anotherUnread: RawMessageRow = {
+      ...rows[1]!,
+      subject: '另一封未读报告',
+      receivedAt: '2026-08-19T12:00:00+08:00',
+      receivedAtText: '昨日 12:00',
+      preview: '第二页',
+    };
+    vi.mocked(parser.resetAndExtract).mockResolvedValue([rows[0]!, rows[1]!, anotherUnread]);
+    vi.mocked(parser.scrollAndExtract).mockResolvedValue([rows[0]!, rows[1]!, anotherUnread]);
+
+    const first = await service.listByDate({
+      fromDate: '2026-08-19', toDate: '2026-08-20', sender: 'unread@example.com',
+      unread: true, hasAttachments: true, limit: 1,
+    });
+    expect(first).toMatchObject({ date: null, fromDate: '2026-08-19', toDate: '2026-08-20', hasMore: true });
+    expect(first.messages).toHaveLength(1);
+    expect(first.nextCursor).toMatch(/^[A-Za-z0-9_-]+$/);
+
+    const second = await service.listByDate({
+      fromDate: '2026-08-19', toDate: '2026-08-20', sender: 'unread@example.com',
+      unread: true, hasAttachments: true, limit: 1, cursor: first.nextCursor,
+    });
+    expect(second.messages).toHaveLength(1);
+    expect(second.messages[0]?.id).toBe('2');
+    expect(second.hasMore).toBe(false);
+    expect(second.nextCursor).toBeNull();
+  });
+
+  it('rejects a cursor when its directory or filters do not match', async () => {
+    const { service } = await createService();
+    const first = await service.listByDate({ date: '2026-08-20', limit: 1 });
+
+    await expect(service.listByDate({ date: '2026-08-20', limit: 1, unread: true, cursor: first.nextCursor }))
+      .rejects.toMatchObject({ code: 'INVALID_ARGUMENT' });
+  });
+
   it('returns validated Outlook folders', async () => {
     const { service, backend } = await createService();
 
@@ -194,6 +332,7 @@ describe('OutlookService mail listing', () => {
     expect(result.messages).toHaveLength(1);
     expect(result.directory).toMatchObject({ path: '收件箱' });
     expect(result.messages[0]).toMatchObject({ id: '1', subject: '未读邮件', unread: true });
+    expect(result.messages[0]?.stableId).toMatch(/^m_[A-Za-z0-9_-]{20}$/);
     await expect(store.read()).resolves.toMatchObject({ source: 'folder:收件箱' });
   });
 
@@ -272,6 +411,23 @@ describe('OutlookService mail listing', () => {
     });
   });
 
+  it('keeps stable IDs resolvable across list refreshes', async () => {
+    const { service, parser, backend } = await createService();
+    const first = await service.inbox({ limit: 2 });
+    const stableId = first.messages[0]!.stableId;
+    const replacement: RawMessageRow = {
+      ...rows[0]!, subject: '刷新后的邮件', receivedAt: '2026-08-20T10:00:00+08:00', receivedAtText: '10:00',
+    };
+    vi.mocked(parser.resetAndExtract).mockResolvedValueOnce([replacement]);
+    await service.inbox({ limit: 1 });
+    const directory = temporaryDirectories[temporaryDirectories.length - 1]!;
+
+    await service.downloadAttachment(stableId, '1', directory);
+    expect(backend.downloadAttachment).toHaveBeenCalledWith(
+      expect.objectContaining({ subject: '已读邮件' }), 0, directory,
+    );
+  });
+
   it('rejects multiple distinct candidates as ambiguous', async () => {
     const { backend, parser, store } = await createService();
     await store.write({
@@ -313,9 +469,55 @@ describe('OutlookService mail listing', () => {
       },
     });
 
-    await expect(service.move('1', ' 投后 ', true)).resolves.toMatchObject({ moved: true, folder: '投后' });
+    await expect(service.move('1', ' 投后 ', true, 'move-test-001')).resolves.toMatchObject({
+      moved: true, folder: '投后', requestId: 'move-test-001', deduplicated: false,
+    });
     expect(backend.moveMessage).toHaveBeenCalledWith(expect.objectContaining({ subject: '测试主题' }), '投后');
     await expect(store.read()).resolves.toBeNull();
+  });
+
+  it('deduplicates a repeated move request and writes a redacted audit', async () => {
+    const { service, backend, store, mutationStore } = await createService();
+    await store.write({
+      version: 1, updatedAt: '2026-08-20T01:00:00.000Z', source: 'inbox',
+      messages: {
+        '1': {
+          subject: '敏感测试主题', senderName: '张三', senderAddress: 'secret@example.com', receivedAt: null,
+          receivedAtText: null, preview: '敏感正文预览', hasAttachments: false,
+        },
+      },
+    });
+
+    const first = await service.move('1', '投后', true, 'move-dedupe-001');
+    const second = await service.move('1', '投后', true, 'move-dedupe-001');
+
+    expect(first.deduplicated).toBe(false);
+    expect(second.deduplicated).toBe(true);
+    expect(backend.moveMessage).toHaveBeenCalledOnce();
+    const audit = await readFile(mutationStore.auditPath, 'utf8');
+    expect(audit).toContain('m_');
+    expect(audit).not.toContain('敏感测试主题');
+    expect(audit).not.toContain('secret@example.com');
+    expect(audit).not.toContain('敏感正文预览');
+    expect((await stat(mutationStore.path)).mode & 0o777).toBe(0o600);
+    expect((await stat(mutationStore.auditPath)).mode & 0o777).toBe(0o600);
+  });
+
+  it('rejects reusing a request ID with different mutation parameters', async () => {
+    const { service, store } = await createService();
+    await store.write({
+      version: 1, updatedAt: '2026-08-20T01:00:00.000Z', source: 'inbox',
+      messages: {
+        '1': {
+          subject: '测试主题', senderName: null, senderAddress: null, receivedAt: null,
+          receivedAtText: null, preview: null, hasAttachments: false,
+        },
+      },
+    });
+    await service.move('1', '投后', true, 'move-conflict-001');
+
+    await expect(service.move('1', '归档', true, 'move-conflict-001'))
+      .rejects.toMatchObject({ code: 'INVALID_ARGUMENT' });
   });
 
   it('returns the verified local attachment download result', async () => {
@@ -379,11 +581,48 @@ describe('OutlookService mail listing', () => {
       draft: false, replyAll: true, handedOff: false,
     });
 
-    await expect(service.reply('1', '请大家查收。', false, true)).resolves.toEqual({
+    await expect(service.reply('1', '请大家查收。', false, true, 'reply-test-001')).resolves.toEqual({
       id: '1', draft: false, replyAll: true, sent: true,
       requiresManualSend: false, handedOff: false, verified: true,
+      requestId: 'reply-test-001', deduplicated: false,
     });
     expect(backend.replyMessage).toHaveBeenCalledWith(expect.any(Object), '请大家查收。', false, true);
+  });
+
+  it('deduplicates automatic replies by request ID', async () => {
+    const { service, backend, store } = await createService();
+    await store.write({
+      version: 1, updatedAt: '2026-08-20T01:00:00.000Z', source: 'inbox',
+      messages: {
+        '1': {
+          subject: '测试主题', senderName: '张三', senderAddress: 'zhangsan@example.com',
+          receivedAt: null, receivedAtText: null, preview: null, hasAttachments: false,
+        },
+      },
+    });
+    vi.mocked(backend.replyMessage).mockResolvedValue({
+      matchCount: 1, status: 'sent', performed: true, verified: true,
+      draft: false, replyAll: false, handedOff: false,
+    });
+
+    await service.reply('1', '同一内容', false, false, 'reply-dedupe-001');
+    const repeated = await service.reply('1', '同一内容', false, false, 'reply-dedupe-001');
+
+    expect(repeated.deduplicated).toBe(true);
+    expect(backend.replyMessage).toHaveBeenCalledOnce();
+  });
+
+  it('reports doctor checks without mutating the mailbox', async () => {
+    const { service, backend } = await createService();
+    vi.mocked(backend.eval).mockResolvedValueOnce({ searchInputs: 1, mailLists: 1, readingPanes: 0 });
+
+    const result = await service.doctor();
+
+    expect(result.ok).toBe(Number(process.versions.node.split('.')[0]) >= 24);
+    expect(result.checks.map(check => check.name)).toEqual(['node', 'ego-lite', 'authentication', 'dom']);
+    expect(backend.deleteMessage).not.toHaveBeenCalled();
+    expect(backend.moveMessage).not.toHaveBeenCalled();
+    expect(backend.replyMessage).not.toHaveBeenCalled();
   });
 
   it('rejects an empty reply before opening Outlook', async () => {
@@ -456,5 +695,138 @@ describe('OutlookService mail listing', () => {
     expect(markdown).toContain('## 正文\n\n测试正文');
     expect(markdown).toContain(`](${result.attachments[0]?.link})`);
     await expect(stat(result.attachments[0]!.path)).resolves.toMatchObject({ size: 10 });
+  });
+
+  it('creates a new mail draft by default without requiring a request ID', async () => {
+    const { service, backend } = await createService();
+
+    await expect(service.compose({
+      to: [' Alice@example.com ', 'alice@example.com'], cc: [], bcc: [],
+      subject: ' 测试新邮件 ', content: '正文', attachments: [], draft: true,
+    })).resolves.toMatchObject({
+      draft: true, sent: false, requiresManualSend: true, handedOff: true, verified: true,
+    });
+    expect(backend.composeMessage).toHaveBeenCalledWith(expect.objectContaining({
+      to: ['Alice@example.com'], subject: '测试新邮件', draft: true,
+    }));
+  });
+
+  it('requires and deduplicates request IDs for automatic new-mail sending', async () => {
+    const { service, backend } = await createService();
+    const options = {
+      to: ['to@example.com'], cc: [], bcc: [], subject: '自动发送',
+      content: '正文', attachments: [], draft: false,
+    };
+    vi.mocked(backend.composeMessage).mockResolvedValue({
+      status: 'sent', performed: true, verified: true, draft: false,
+      handedOff: false, attachmentCount: 0,
+    });
+
+    await expect(service.compose(options)).rejects.toMatchObject({ code: 'INVALID_ARGUMENT' });
+    await service.compose(options, 'compose-send-001');
+    await expect(service.compose(options, 'compose-send-001')).resolves.toMatchObject({
+      sent: true, deduplicated: true,
+    });
+    expect(backend.composeMessage).toHaveBeenCalledOnce();
+  });
+
+  it('creates a forward draft while preserving original attachments', async () => {
+    const { service, backend, store } = await createService();
+    await store.write({
+      version: 1, updatedAt: '2026-08-20T01:00:00.000Z', source: 'inbox',
+      messages: { '1': { ...rows[0]!, preview: rows[0]!.preview } },
+    });
+
+    await expect(service.forward('1', {
+      to: ['to@example.com'], cc: [], bcc: [], content: '请查收', attachments: [], draft: true,
+    })).resolves.toMatchObject({
+      id: '1', draft: true, originalAttachmentsPreserved: true, handedOff: true,
+    });
+    expect(backend.forwardMessage).toHaveBeenCalledWith(
+      expect.objectContaining({ subject: '已读邮件' }), expect.objectContaining({ content: '请查收' }),
+    );
+  });
+
+  it('lists, reads, updates, sends and discards drafts through verified controls', async () => {
+    const { service, backend, store } = await createService();
+    const listed = await service.drafts({ limit: 1 });
+    expect(listed.directory).toMatchObject({ path: '草稿' });
+    expect(backend.selectSystemFolder).toHaveBeenCalledWith('草稿');
+
+    await expect(service.readDraft('1')).resolves.toMatchObject({
+      subject: '草稿主题', to: [{ address: 'to@example.com' }],
+    });
+    await expect(service.updateDraft('1', {
+      subject: '更新主题', content: '更新正文', attachments: [],
+    })).resolves.toMatchObject({ updated: true, sessionInvalidated: true });
+    expect(backend.updateDraft).toHaveBeenCalledWith(
+      expect.any(Object), expect.objectContaining({ subject: '更新主题', content: '更新正文' }),
+    );
+
+    await service.drafts({ limit: 1 });
+    await expect(service.sendDraft('1', 'draft-send-001')).resolves.toMatchObject({ sent: true });
+    await service.drafts({ limit: 1 });
+    await expect(service.discardDraft('1', false, 'draft-discard-001'))
+      .rejects.toMatchObject({ code: 'CONFIRMATION_REQUIRED' });
+    await expect(service.discardDraft('1', true, 'draft-discard-001'))
+      .resolves.toMatchObject({ discarded: true });
+    await expect(store.read()).resolves.toBeNull();
+  });
+
+  it('changes read, flag and category state and returns a parsed conversation', async () => {
+    const { service, backend, store } = await createService();
+    await store.write({
+      version: 1, updatedAt: '2026-08-20T01:00:00.000Z', source: 'inbox',
+      messages: { '1': { ...rows[0]!, preview: rows[0]!.preview } },
+    });
+
+    await expect(service.markRead('1', false)).resolves.toMatchObject({ unread: false, changed: true });
+    await expect(service.flag('1', true)).resolves.toMatchObject({ flagged: true, changed: true });
+    await expect(service.categorize('1', ' 项目A ', true)).resolves.toMatchObject({
+      category: '项目A', applied: true, changed: true,
+    });
+    await expect(service.conversation('1')).resolves.toMatchObject({
+      complete: true, messages: [{ index: 1, bodyText: '会话正文' }],
+    });
+    expect(backend.setReadState).toHaveBeenCalledWith(expect.any(Object), false);
+    expect(backend.setFlagState).toHaveBeenCalledWith(expect.any(Object), true);
+    expect(backend.setCategoryState).toHaveBeenCalledWith(expect.any(Object), '项目A', true);
+  });
+
+  it('downloads every attachment and reports a SHA-256 digest', async () => {
+    const { backend, parser, store } = await createService();
+    await store.write({
+      version: 1, updatedAt: '2026-08-20T01:00:00.000Z', source: 'inbox',
+      messages: { '1': { ...rows[1]!, preview: rows[1]!.preview } },
+    });
+    const messageParser: MessageParser = {
+      openAndExtract: vi.fn().mockResolvedValue({
+        matchCount: 1,
+        message: {
+          subject: '未读邮件', fromName: null, fromAddress: 'unread@example.com', to: [], cc: [],
+          receivedAt: null, receivedAtText: null, bodyText: '正文',
+          attachments: [{ filename: 'report.xlsx', sizeText: '10 B' }],
+        },
+      }),
+    };
+    vi.mocked(backend.downloadAttachment).mockImplementation(async (_locator, _index, outputDirectory) => {
+      const path = join(outputDirectory, 'report.xlsx');
+      await writeFile(path, 'attachment');
+      return {
+        matchCount: 1, status: 'performed', performed: true, verified: true,
+        filename: 'report.xlsx', path, bytes: 10,
+      };
+    });
+    const service = new OutlookService(backend, store, parser, messageParser);
+    const outputDirectory = temporaryDirectories[temporaryDirectories.length - 1]!;
+    await writeFile(join(outputDirectory, 'report.xlsx'), 'existing');
+
+    await expect(service.downloadAll('1', outputDirectory)).resolves.toMatchObject({
+      attachments: [{
+        id: '1', filename: 'report (2).xlsx', bytes: 10,
+        sha256: createHash('sha256').update('attachment').digest('hex'),
+      }],
+    });
+    await expect(readFile(join(outputDirectory, 'report.xlsx'), 'utf8')).resolves.toBe('existing');
   });
 });

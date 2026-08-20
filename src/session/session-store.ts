@@ -20,6 +20,7 @@ const sessionSchema = z.object({
   updatedAt: z.string(),
   source: z.string(),
   messages: z.record(z.string(), sessionMessageSchema),
+  stableMessages: z.record(z.string(), sessionMessageSchema).optional(),
 });
 
 export type MailSession = z.infer<typeof sessionSchema>;
