@@ -1,9 +1,11 @@
 node_modules/
 dist/
+release/
 coverage/
 downloads/
 .codex-handoff/
 .webmail-cli/
+playwright-profile/
 .env
 .env.*
 *.session.json

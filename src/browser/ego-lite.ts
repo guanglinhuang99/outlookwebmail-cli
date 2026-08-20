@@ -1,5 +1,5 @@
-import type { BrowserBackend } from './backend.js';
-import { EgoRunner } from './ego-runner.js';
+import type { BrowserBackend, BrowserBackendName } from './backend.js';
+import { EgoRunner, type BrowserScriptRunner } from './ego-runner.js';
 import type { BrowserStatus, InspectResult, LoginHandoffResult, MessageInspectResult, PageInfo } from '../types/inspect.js';
 import type {
   AttachmentDownloadResult,
@@ -93,7 +93,13 @@ function actionFailure(opened: MessageOpenResult): MessageActionResult | null {
 }
 
 export class EgoLiteBackend implements BrowserBackend {
-  constructor(private readonly runner = new EgoRunner()) {}
+  readonly name: BrowserBackendName = 'ego-lite';
+
+  constructor(protected readonly runner: BrowserScriptRunner = new EgoRunner()) {}
+
+  async close(): Promise<void> {
+    await this.runner.close?.();
+  }
 
   private async runComposeAction(
     options: ComposeOptions | ForwardOptions,

@@ -17,6 +17,7 @@ import type {
 } from '../types/mail.js';
 
 export interface BrowserBackend {
+  readonly name?: BrowserBackendName;
   status(): Promise<BrowserStatus>;
   handoffForLogin(): Promise<LoginHandoffResult>;
   snapshot(): Promise<string>;
@@ -50,4 +51,7 @@ export interface BrowserBackend {
   setFlagState(locator: MessageLocator, flagged: boolean): Promise<MessageStateActionResult>;
   setCategoryState(locator: MessageLocator, category: string, applied: boolean): Promise<MessageStateActionResult>;
   getConversation(locator: MessageLocator): Promise<ConversationOpenResult>;
+  close?(): Promise<void>;
 }
+
+export type BrowserBackendName = 'playwright' | 'ego-lite';

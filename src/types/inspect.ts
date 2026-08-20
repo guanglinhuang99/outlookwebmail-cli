@@ -19,6 +19,7 @@ export interface BrowserStatus {
   title: string | null;
   page: PageInfo;
   snapshot: string;
+  browserName?: string | null;
 }
 
 export interface LoginHandoffResult {
@@ -28,14 +29,15 @@ export interface LoginHandoffResult {
 }
 
 export interface StatusResult {
-  backend: 'ego-lite';
+  backend: 'ego-lite' | 'playwright';
+  browser?: string | null;
   url: string;
   title: string | null;
   state: OutlookState;
 }
 
 export interface DoctorCheck {
-  name: 'node' | 'ego-lite' | 'authentication' | 'dom';
+  name: 'node' | 'ego-lite' | 'playwright' | 'authentication' | 'dom';
   status: 'pass' | 'warn' | 'fail';
   message: string;
 }
@@ -46,7 +48,7 @@ export interface DoctorResult {
 }
 
 export interface InspectResult {
-  backend: 'ego-lite';
+  backend: 'ego-lite' | 'playwright';
   capturedAt: string;
   state: OutlookState;
   page: PageInfo;
@@ -59,7 +61,7 @@ export interface InspectResult {
 }
 
 export interface MessageInspectResult {
-  backend: 'ego-lite';
+  backend: 'ego-lite' | 'playwright';
   capturedAt: string;
   state: OutlookState;
   page: PageInfo;
