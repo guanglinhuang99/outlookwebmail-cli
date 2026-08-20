@@ -346,6 +346,13 @@ if (target.count !== 1 || !target.rect || !target.folder) {
     const searchSelector = 'input[role="combobox"][aria-label^="搜索"], input[role="combobox"][aria-label^="Search"]';
     const exitSearchSelector = 'button[aria-label="退出搜索"], button[aria-label="Exit search"]';
     const script = `${bootstrap()}
+let searchReady = false;
+for (let attempt = 0; attempt < 20; attempt += 1) {
+  const searchCount = await js(${JSON.stringify(`(() => document.querySelectorAll(${JSON.stringify(searchSelector)}).length)()`)});
+  if (searchCount === 1) { searchReady = true; break; }
+  await wait(0.3);
+}
+if (!searchReady) throw new Error('Outlook search input did not become ready');
 const activeSearch = await js(${JSON.stringify(`(() => {
   const input = document.querySelector(${JSON.stringify(searchSelector)});
   return Boolean(input && input.value);

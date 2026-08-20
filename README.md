@@ -22,6 +22,7 @@ webmail inspect-message --json
 webmail read 3 --json
 webmail attachments 3 --json
 webmail download 3 1 --output ./downloads --json
+webmail export 3 --output /path/to/obsidian-vault/邮件 --json
 webmail move 3 "投后" --yes --json
 webmail delete 3 --yes --json
 ```
@@ -35,6 +36,7 @@ webmail delete 3 --yes --json
 - `read`：返回邮件头、纯文本正文和附件元数据。
 - `attachments`：只返回附件名称和大小。
 - `download`：将指定附件下载到本地目录并返回绝对路径和字节数。
+- `export`：将一封邮件导出为带 YAML 属性的 Obsidian Markdown；全部附件下载到相对的 `attachments/<邮件标识>/` 目录，并在 Markdown 中生成可点击的相对链接。同名导出自动增加序号，不覆盖已有文件。
 - `move`：只接受移动菜单中完全匹配的目录名，并要求 `--yes`。
 - `delete`：将邮件移入“已删除邮件”，并要求 `--yes`。
 

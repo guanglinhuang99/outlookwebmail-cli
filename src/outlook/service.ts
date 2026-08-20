@@ -9,6 +9,7 @@ import type {
   MailSummary,
   MessageActionResult,
   MessageLocator,
+  ObsidianExportResult,
   RawMessageRow,
 } from '../types/mail.js';
 import type { InspectResult, MessageInspectResult, StatusResult } from '../types/inspect.js';
@@ -19,6 +20,12 @@ import { EgoMessageParser, type MessageParser } from './message-parser.js';
 import { FolderParser } from './folder-parser.js';
 import { SessionStore } from '../session/session-store.js';
 import { detectOutlookState } from './state.js';
+import {
+  attachmentLink,
+  chooseExportPaths,
+  renderObsidianMarkdown,
+  writeMarkdownAtomically,
+} from '../export/obsidian.js';
 
 const SEARCH_SELECTOR = 'input[role="combobox"][aria-label^="搜索"], input[role="combobox"][aria-label^="Search"]';
 const EXIT_SEARCH_SELECTOR = 'button[aria-label="退出搜索"], button[aria-label="Exit search"]';
@@ -407,5 +414,40 @@ export class OutlookService {
     );
     this.assertPerformed(id, result);
     return result;
+  }
+
+  async exportObsidian(id: string, outputDirectory: string): Promise<ObsidianExportResult> {
+    if (!outputDirectory.normalize('NFKC').trim()) {
+      throw new AppError('INVALID_ARGUMENT', '导出目录不能为空。');
+    }
+
+    const message = await this.read(id);
+    const paths = await chooseExportPaths(message, outputDirectory);
+    if (paths.attachmentDirectory) await mkdir(paths.attachmentDirectory, { recursive: true });
+
+    const attachments = [];
+    for (const attachment of message.attachments) {
+      const downloaded = await this.downloadAttachment(id, attachment.id, paths.attachmentDirectory!);
+      if (!downloaded.path || !downloaded.filename || downloaded.bytes === undefined) {
+        throw new AppError('OPERATION_FAILED', `附件 ${attachment.id} 已下载，但返回结果缺少文件信息。`);
+      }
+      attachments.push({
+        id: attachment.id,
+        filename: downloaded.filename,
+        path: downloaded.path,
+        bytes: downloaded.bytes,
+        link: attachmentLink(paths.markdownPath, downloaded.path),
+      });
+    }
+
+    const markdown = renderObsidianMarkdown(message, attachments);
+    const bytes = await writeMarkdownAtomically(paths.markdownPath, markdown);
+    return {
+      id,
+      markdownPath: paths.markdownPath,
+      attachmentDirectory: paths.attachmentDirectory,
+      attachments,
+      bytes,
+    };
   }
 }

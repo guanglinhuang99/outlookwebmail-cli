@@ -120,3 +120,19 @@ export interface AttachmentDownloadResult extends MessageActionResult {
   path?: string;
   bytes?: number;
 }
+
+export interface ExportedAttachment {
+  id: string;
+  filename: string;
+  path: string;
+  bytes: number;
+  link: string;
+}
+
+export interface ObsidianExportResult {
+  id: string;
+  markdownPath: string;
+  attachmentDirectory: string | null;
+  attachments: ExportedAttachment[];
+  bytes: number;
+}

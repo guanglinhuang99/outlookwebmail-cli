@@ -1,4 +1,4 @@
-import { mkdtemp, rm } from 'node:fs/promises';
+import { mkdtemp, readFile, rm, stat, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { afterEach, describe, expect, it, vi } from 'vitest';
@@ -289,5 +289,50 @@ describe('OutlookService mail listing', () => {
       status: 'performed', filename: 'report.xlsx', verified: true,
     });
     expect(backend.downloadAttachment).toHaveBeenCalledWith(expect.any(Object), 0, directory);
+  });
+
+  it('exports one message and downloaded attachments as Obsidian Markdown', async () => {
+    const { backend, parser, store } = await createService();
+    await store.write({
+      version: 1, updatedAt: '2026-08-20T01:00:00.000Z', source: 'inbox',
+      messages: {
+        '1': {
+          subject: '测试主题', senderName: '张三', senderAddress: 'zhangsan@example.com',
+          receivedAt: '2026-08-20T09:30:00+08:00', receivedAtText: '9:30',
+          preview: '测试预览', hasAttachments: true,
+        },
+      },
+    });
+    const messageParser: MessageParser = {
+      openAndExtract: vi.fn().mockResolvedValue({
+        matchCount: 1,
+        message: {
+          subject: '测试主题', fromName: '张三', fromAddress: 'zhangsan@example.com',
+          to: [{ name: '李四', address: 'lisi@example.com' }], cc: [],
+          receivedAt: '2026-08-20T09:30:00+08:00', receivedAtText: '2026/8/20 9:30',
+          bodyText: '测试正文', attachments: [{ filename: '附件 报告.xlsx', sizeText: '12 KB' }],
+        },
+      }),
+    };
+    vi.mocked(backend.downloadAttachment).mockImplementation(async (_locator, _index, outputDirectory) => {
+      const path = join(outputDirectory, '附件 报告.xlsx');
+      await writeFile(path, 'attachment');
+      return {
+        matchCount: 1, status: 'performed', performed: true, verified: true,
+        attachmentCount: 1, attachmentId: '1', filename: '附件 报告.xlsx', path, bytes: 10,
+      };
+    });
+    const service = new OutlookService(backend, store, parser, messageParser);
+    const outputDirectory = temporaryDirectories[temporaryDirectories.length - 1]!;
+
+    const result = await service.exportObsidian('1', outputDirectory);
+    const markdown = await readFile(result.markdownPath, 'utf8');
+
+    expect(result.attachments).toHaveLength(1);
+    expect(result.attachments[0]?.link).toMatch(/^attachments\/.+\/%E9%99%84%E4%BB%B6%20%E6%8A%A5%E5%91%8A\.xlsx$/);
+    expect(markdown).toContain('# 测试主题');
+    expect(markdown).toContain('## 正文\n\n测试正文');
+    expect(markdown).toContain(`](${result.attachments[0]?.link})`);
+    await expect(stat(result.attachments[0]!.path)).resolves.toMatchObject({ size: 10 });
   });
 });

@@ -136,6 +136,16 @@ export function createProgram(service = new OutlookService(new EgoLiteBackend())
     });
 
   program
+    .command('export')
+    .description('将一封邮件导出为 Obsidian Markdown，并下载全部附件')
+    .argument('<id>', 'inbox/search/today 返回的邮件数字短 ID')
+    .requiredOption('-o, --output <directory>', 'Markdown 导出目录')
+    .option('--json', '输出单一 JSON envelope')
+    .action(async (id: string, options: { output: string; json?: boolean }) => {
+      await execute(Boolean(options.json), () => service.exportObsidian(id, options.output));
+    });
+
+  program
     .command('move')
     .description('将邮件移动到完全匹配的 Outlook 目录')
     .argument('<id>', 'inbox/search/today 返回的邮件数字短 ID')
