@@ -121,6 +121,39 @@ export interface AttachmentDownloadResult extends MessageActionResult {
   bytes?: number;
 }
 
+export type ReplyActionStatus =
+  | 'draft_ready'
+  | 'sent'
+  | 'message_not_found'
+  | 'message_ambiguous'
+  | 'reading_pane_not_ready'
+  | 'reply_control_not_found'
+  | 'reply_control_ambiguous'
+  | 'editor_not_ready'
+  | 'content_not_verified'
+  | 'send_control_not_found'
+  | 'send_not_verified';
+
+export interface ReplyActionResult {
+  matchCount: number;
+  status: ReplyActionStatus;
+  performed: boolean;
+  verified: boolean;
+  draft: boolean;
+  replyAll: boolean;
+  handedOff?: boolean;
+}
+
+export interface ReplyResult {
+  id: string;
+  draft: boolean;
+  replyAll: boolean;
+  sent: boolean;
+  requiresManualSend: boolean;
+  handedOff: boolean;
+  verified: true;
+}
+
 export interface ExportedAttachment {
   id: string;
   filename: string;

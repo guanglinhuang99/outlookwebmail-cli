@@ -8,6 +8,7 @@ import type {
   MessageActionResult,
   MessageLocator,
   MessageOpenResult,
+  ReplyActionResult,
 } from '../types/mail.js';
 import {
   ATTACHMENT_CANDIDATES,
@@ -541,6 +542,133 @@ if (!moveControl.rect) {
 }
 `;
     return (await this.runner.run<MessageActionResult>(script, 55_000)).value;
+  }
+
+  async replyMessage(
+    locator: MessageLocator,
+    content: string,
+    draft: boolean,
+    replyAll: boolean,
+  ): Promise<ReplyActionResult> {
+    const opened = await this.openAndExtractMessage(locator);
+    if (opened.matchCount !== 1 || !opened.message) {
+      return {
+        matchCount: opened.matchCount,
+        status: opened.matchCount > 1
+          ? 'message_ambiguous'
+          : opened.matchCount === 0
+            ? 'message_not_found'
+            : 'reading_pane_not_ready',
+        performed: false,
+        verified: false,
+        draft,
+        replyAll,
+      };
+    }
+
+    const replyTargetScript = String.raw`(() => {
+  const replyAll = ${JSON.stringify(replyAll)};
+  const matcher = replyAll ? /^(全部答复|reply all)$/i : /^(答复|reply)$/i;
+  const pane = document.querySelector('[role="main"][aria-label="阅读窗格"], [role="main"][aria-label="Reading pane"]');
+  const buttons = pane ? Array.from(pane.querySelectorAll('button[aria-label]'))
+    .filter(el => matcher.test((el.getAttribute('aria-label') || '').normalize('NFKC').trim())) : [];
+  if (buttons.length !== 1) return { count: buttons.length, rect: null };
+  buttons[0].scrollIntoView({ block: 'center', inline: 'center' });
+  const rect = buttons[0].getBoundingClientRect();
+  const inViewport = rect.width > 0 && rect.height > 0 && rect.bottom > 0 && rect.top < innerHeight;
+  return { count: 1, rect: inViewport ? { x: rect.x + rect.width / 2, y: rect.y + rect.height / 2 } : null };
+})()`;
+    const editorScript = String.raw`(() => {
+  const inViewport = el => {
+    const rect = el.getBoundingClientRect();
+    const style = getComputedStyle(el);
+    return rect.width > 0 && rect.height > 0 && rect.bottom > 0 && rect.top < innerHeight
+      && style.display !== 'none' && style.visibility !== 'hidden';
+  };
+  const editors = Array.from(document.querySelectorAll('[contenteditable="true"][role="textbox"][aria-label]'))
+    .filter(inViewport)
+    .filter(el => /^(邮件正文|message body)$/i.test((el.getAttribute('aria-label') || '').normalize('NFKC').trim()));
+  if (editors.length !== 1) return { count: editors.length, rect: null };
+  const rect = editors[0].getBoundingClientRect();
+  return { count: 1, rect: { x: rect.x + Math.min(20, rect.width / 2), y: rect.y + Math.min(20, rect.height / 2) } };
+})()`;
+    const contentVerifiedScript = String.raw`(() => {
+  const inViewport = el => { const rect = el.getBoundingClientRect(); return rect.width > 0 && rect.height > 0 && rect.bottom > 0 && rect.top < innerHeight; };
+  const editors = Array.from(document.querySelectorAll('[contenteditable="true"][role="textbox"][aria-label]'))
+    .filter(inViewport)
+    .filter(el => /^(邮件正文|message body)$/i.test((el.getAttribute('aria-label') || '').normalize('NFKC').trim()));
+  if (editors.length !== 1) return false;
+  const clean = value => (value || '').normalize('NFKC').replace(/\r\n/g, '\n').replace(/\u00a0/g, ' ').trim();
+  return clean(editors[0].innerText || editors[0].textContent).includes(clean(${JSON.stringify(content)}));
+})()`;
+    const sendTargetScript = String.raw`(() => {
+  const inViewport = el => { const rect = el.getBoundingClientRect(); return rect.width > 0 && rect.height > 0 && rect.bottom > 0 && rect.top < innerHeight; };
+  const buttons = Array.from(document.querySelectorAll('button[aria-label]')).filter(inViewport)
+    .filter(el => /^(发送|send)$/i.test((el.getAttribute('aria-label') || '').normalize('NFKC').trim()));
+  if (buttons.length !== 1) return { count: buttons.length, rect: null };
+  const rect = buttons[0].getBoundingClientRect();
+  return { count: 1, rect: { x: rect.x + rect.width / 2, y: rect.y + rect.height / 2 } };
+})()`;
+    const editorClosedScript = String.raw`(() => {
+  const inViewport = el => { const rect = el.getBoundingClientRect(); return rect.width > 0 && rect.height > 0 && rect.bottom > 0 && rect.top < innerHeight; };
+  return !Array.from(document.querySelectorAll('[contenteditable="true"][role="textbox"][aria-label]'))
+    .filter(inViewport)
+    .some(el => /^(邮件正文|message body)$/i.test((el.getAttribute('aria-label') || '').normalize('NFKC').trim()));
+})()`;
+    const commonResult = `draft: ${JSON.stringify(draft)}, replyAll: ${JSON.stringify(replyAll)}`;
+    const script = `${resumeTaskSpace()}
+const replyTarget = await js(${JSON.stringify(replyTargetScript)});
+if (replyTarget.count !== 1) {
+  ${markedResult(`{ matchCount: 1, status: replyTarget.count > 1 ? 'reply_control_ambiguous' : 'reply_control_not_found', performed: false, verified: false, ${commonResult} }`)}
+} else if (!replyTarget.rect) {
+  ${markedResult(`{ matchCount: 1, status: 'reply_control_not_found', performed: false, verified: false, ${commonResult} }`)}
+} else {
+  await click(replyTarget.rect);
+  let editor = null;
+  for (let attempt = 0; attempt < 20; attempt += 1) {
+    await wait(0.3);
+    editor = await js(${JSON.stringify(editorScript)});
+    if (editor.count === 1 && editor.rect) break;
+  }
+  if (!editor || editor.count !== 1 || !editor.rect) {
+    const handoff = await handOffTaskSpace(task.id);
+    ${markedResult(`{ matchCount: 1, status: 'editor_not_ready', performed: false, verified: false, handedOff: Boolean(handoff.done || handoff.skipped === 'user-owned'), ${commonResult} }`)}
+  } else {
+    await click(editor.rect);
+    await cdp('Input.insertText', { text: ${JSON.stringify(content)} });
+    await wait(0.5);
+    const contentVerified = await js(${JSON.stringify(contentVerifiedScript)});
+    if (!contentVerified) {
+      const handoff = await handOffTaskSpace(task.id);
+      ${markedResult(`{ matchCount: 1, status: 'content_not_verified', performed: true, verified: false, handedOff: Boolean(handoff.done || handoff.skipped === 'user-owned'), ${commonResult} }`)}
+    } else if (${JSON.stringify(draft)}) {
+      const handoff = await handOffTaskSpace(task.id);
+      ${markedResult(`{ matchCount: 1, status: 'draft_ready', performed: true, verified: true, handedOff: Boolean(handoff.done || handoff.skipped === 'user-owned'), ${commonResult} }`)}
+    } else {
+      const sendTarget = await js(${JSON.stringify(sendTargetScript)});
+      if (sendTarget.count !== 1 || !sendTarget.rect) {
+        const handoff = await handOffTaskSpace(task.id);
+        ${markedResult(`{ matchCount: 1, status: 'send_control_not_found', performed: true, verified: false, handedOff: Boolean(handoff.done || handoff.skipped === 'user-owned'), ${commonResult} }`)}
+      } else {
+        await click(sendTarget.rect);
+        let sent = false;
+        for (let attempt = 0; attempt < 30; attempt += 1) {
+          await wait(0.3);
+          sent = await js(${JSON.stringify(editorClosedScript)});
+          if (sent) break;
+        }
+        if (sent) {
+          ${markedResult(`{ matchCount: 1, status: 'sent', performed: true, verified: true, handedOff: false, ${commonResult} }`)}
+        } else {
+          const handoff = await handOffTaskSpace(task.id);
+          ${markedResult(`{ matchCount: 1, status: 'send_not_verified', performed: true, verified: false, handedOff: Boolean(handoff.done || handoff.skipped === 'user-owned'), ${commonResult} }`)}
+        }
+      }
+    }
+  }
+}
+`;
+    return (await this.runner.run<ReplyActionResult>(script, 90_000)).value;
   }
 
   async downloadAttachment(

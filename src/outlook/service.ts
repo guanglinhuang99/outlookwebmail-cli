@@ -11,6 +11,8 @@ import type {
   MessageLocator,
   ObsidianExportResult,
   RawMessageRow,
+  ReplyActionResult,
+  ReplyResult,
 } from '../types/mail.js';
 import type { InspectResult, MessageInspectResult, StatusResult } from '../types/inspect.js';
 import { AppError } from '../util/errors.js';
@@ -51,6 +53,35 @@ export interface InboxOptions {
 export interface MailListResult {
   directory: FolderSummary | null;
   messages: MailSummary[];
+}
+
+export interface DatedMailListResult extends MailListResult {
+  date: string;
+}
+
+export interface DatedMailListOptions {
+  date?: string | null;
+  directory?: string | null;
+}
+
+function currentShanghaiDate(): string {
+  return new Intl.DateTimeFormat('en-CA', {
+    timeZone: 'Asia/Shanghai', year: 'numeric', month: '2-digit', day: '2-digit',
+  }).format(new Date());
+}
+
+function normalizeMailDate(value?: string | null): string {
+  const normalized = value?.normalize('NFKC').trim() || currentShanghaiDate();
+  const match = /^(\d{4})-(\d{2})-(\d{2})$/.exec(normalized);
+  if (!match) throw new AppError('INVALID_ARGUMENT', '--date 必须使用 YYYY-MM-DD 格式。');
+  const year = Number(match[1]);
+  const month = Number(match[2]);
+  const day = Number(match[3]);
+  const date = new Date(Date.UTC(year, month - 1, day));
+  if (date.getUTCFullYear() !== year || date.getUTCMonth() !== month - 1 || date.getUTCDate() !== day) {
+    throw new AppError('INVALID_ARGUMENT', '--date 不是有效的日历日期。');
+  }
+  return normalized;
 }
 
 function requireReadyPage(page: { url?: string; dialog?: unknown }, snapshot: string): string {
@@ -230,22 +261,20 @@ export class OutlookService {
     return await this.list(`search:${normalizedQuery}`, options, null);
   }
 
-  async today(directoryName?: string | null): Promise<MailListResult> {
+  async listByDate(options: DatedMailListOptions = {}): Promise<DatedMailListResult> {
+    const targetDate = normalizeMailDate(options.date);
     await this.ensureReady();
     await this.clearSearch();
-    const directory = await this.selectDirectory(directoryName);
-    const today = new Intl.DateTimeFormat('en-CA', {
-      timeZone: 'Asia/Shanghai', year: 'numeric', month: '2-digit', day: '2-digit',
-    }).format(new Date());
+    const directory = await this.selectDirectory(options.directory);
     const rowsByFingerprint = new Map<string, RawMessageRow>();
     let rows = await this.inboxParser.resetAndExtract();
     let previousPage = '';
     let complete = false;
     for (let attempt = 0; attempt < 100; attempt += 1) {
       for (const row of rows) {
-        if (row.receivedAt?.slice(0, 10) === today) rowsByFingerprint.set(messageFingerprint(row), row);
+        if (row.receivedAt?.slice(0, 10) === targetDate) rowsByFingerprint.set(messageFingerprint(row), row);
       }
-      if (rows.some(row => row.receivedAt && row.receivedAt.slice(0, 10) < today)) {
+      if (rows.some(row => row.receivedAt && row.receivedAt.slice(0, 10) < targetDate)) {
         complete = true;
         break;
       }
@@ -258,7 +287,7 @@ export class OutlookService {
       rows = await this.inboxParser.scrollAndExtract();
     }
     if (!complete) {
-      throw new AppError('OPERATION_FAILED', '今日邮件超过 100 个虚拟滚动页，已拒绝返回可能不完整的结果。');
+      throw new AppError('OPERATION_FAILED', `${targetDate} 的邮件超过 100 个虚拟滚动页，已拒绝返回可能不完整的结果。`);
     }
 
     const messages: MailSummary[] = Array.from(rowsByFingerprint.values()).map((row, index) => ({
@@ -274,7 +303,7 @@ export class OutlookService {
     await this.sessionStore.write({
       version: 1,
       updatedAt: new Date().toISOString(),
-      source: `today:${directory.path}:${today}`,
+      source: `date:${directory.path}:${targetDate}`,
       messages: Object.fromEntries(messages.map(message => [message.id, {
         subject: message.subject,
         senderName: message.sender.name,
@@ -285,7 +314,11 @@ export class OutlookService {
         hasAttachments: message.hasAttachments,
       }])),
     });
-    return { directory, messages };
+    return { date: targetDate, directory, messages };
+  }
+
+  async today(directoryName?: string | null): Promise<DatedMailListResult> {
+    return await this.listByDate({ directory: directoryName });
   }
 
   async folders(): Promise<{ root: '收件箱'; folders: FolderSummary[] }> {
@@ -296,17 +329,17 @@ export class OutlookService {
   private async sessionLocator(id: string): Promise<MessageLocator> {
     const session = await this.sessionStore.read();
     if (!session) {
-      throw new AppError('INVALID_ARGUMENT', '当前没有邮件列表 Session；请先运行 inbox 或 search。');
+      throw new AppError('INVALID_ARGUMENT', '当前没有邮件列表 Session；请先运行 list、today、inbox 或 search。');
     }
     const message = session.messages[id];
     if (!message) {
-      throw new AppError('INVALID_ARGUMENT', `Session 中不存在邮件 ID ${id}；请重新运行 inbox 或 search。`);
+      throw new AppError('INVALID_ARGUMENT', `Session 中不存在邮件 ID ${id}；请重新运行 list、today、inbox 或 search。`);
     }
     return message;
   }
 
   async read(id: string): Promise<MailMessage> {
-    if (!/^\d+$/.test(id)) throw new AppError('INVALID_ARGUMENT', '邮件 ID 必须是 inbox/search 返回的数字短 ID。');
+    if (!/^\d+$/.test(id)) throw new AppError('INVALID_ARGUMENT', '邮件 ID 必须是 list/today/inbox/search 返回的数字短 ID。');
     await this.ensureReady();
     const locator = await this.sessionLocator(id);
     const result = await this.messageParser.openAndExtract(locator);
@@ -373,7 +406,7 @@ export class OutlookService {
     if (!confirmed) {
       throw new AppError('CONFIRMATION_REQUIRED', '删除邮件必须显式提供 --yes；邮件将移入“已删除邮件”。');
     }
-    if (!/^\d+$/.test(id)) throw new AppError('INVALID_ARGUMENT', '邮件 ID 必须是 inbox/search/today 返回的数字短 ID。');
+    if (!/^\d+$/.test(id)) throw new AppError('INVALID_ARGUMENT', '邮件 ID 必须是 list/today/inbox/search 返回的数字短 ID。');
     await this.ensureReady();
     const result = await this.backend.deleteMessage(await this.sessionLocator(id));
     this.assertPerformed(id, result);
@@ -387,7 +420,7 @@ export class OutlookService {
     confirmed: boolean,
   ): Promise<{ id: string; folder: string; moved: true; verified: true; sessionInvalidated: true }> {
     if (!confirmed) throw new AppError('CONFIRMATION_REQUIRED', '移动邮件必须显式提供 --yes。');
-    if (!/^\d+$/.test(id)) throw new AppError('INVALID_ARGUMENT', '邮件 ID 必须是 inbox/search/today 返回的数字短 ID。');
+    if (!/^\d+$/.test(id)) throw new AppError('INVALID_ARGUMENT', '邮件 ID 必须是 list/today/inbox/search 返回的数字短 ID。');
     const normalizedFolder = folder.normalize('NFKC').trim();
     if (!normalizedFolder) throw new AppError('INVALID_ARGUMENT', '目标目录不能为空。');
     await this.ensureReady();
@@ -397,12 +430,71 @@ export class OutlookService {
     return { id, folder: normalizedFolder, moved: true, verified: true, sessionInvalidated: true };
   }
 
+  private assertReplyPerformed(id: string, result: ReplyActionResult): void {
+    if (result.matchCount > 1 || result.status === 'message_ambiguous') {
+      throw new AppError('AMBIGUOUS_MESSAGE', `邮件 ID ${id} 对应多个候选，已拒绝回复。`);
+    }
+    if (result.matchCount === 0 || result.status === 'message_not_found') {
+      throw new AppError('MESSAGE_NOT_FOUND', `无法重新定位邮件 ID ${id}。`);
+    }
+    if (result.status === 'reply_control_ambiguous') {
+      throw new AppError('UI_CHANGED', 'Outlook 页面中出现多个匹配的回复按钮，已拒绝继续。');
+    }
+    if (!result.verified) {
+      const handoff = result.handedOff ? '；当前回复窗口已交给用户手工检查' : '';
+      throw new AppError('OPERATION_FAILED', `Outlook 回复操作失败：${result.status}${handoff}。`);
+    }
+  }
+
+  async reply(
+    id: string,
+    content: string,
+    draft = true,
+    replyAll = false,
+  ): Promise<ReplyResult> {
+    if (!/^\d+$/.test(id)) {
+      throw new AppError('INVALID_ARGUMENT', '邮件 ID 必须是 list/today/inbox/search 返回的数字短 ID。');
+    }
+    if (!content.trim()) throw new AppError('INVALID_ARGUMENT', '--content 不能为空。');
+    await this.ensureReady();
+    const result = await this.backend.replyMessage(await this.sessionLocator(id), content, draft, replyAll);
+    this.assertReplyPerformed(id, result);
+
+    if (draft) {
+      if (result.status !== 'draft_ready' || !result.performed || !result.handedOff) {
+        throw new AppError('OPERATION_FAILED', '回复草稿已处理，但未能验证草稿窗口已交给用户。');
+      }
+      return {
+        id,
+        draft: true,
+        replyAll,
+        sent: false,
+        requiresManualSend: true,
+        handedOff: true,
+        verified: true,
+      };
+    }
+
+    if (result.status !== 'sent' || !result.performed) {
+      throw new AppError('OPERATION_FAILED', 'Outlook 未能验证回复已经发送。');
+    }
+    return {
+      id,
+      draft: false,
+      replyAll,
+      sent: true,
+      requiresManualSend: false,
+      handedOff: false,
+      verified: true,
+    };
+  }
+
   async downloadAttachment(
     id: string,
     attachmentId: string,
     outputDirectory: string,
   ): Promise<AttachmentDownloadResult> {
-    if (!/^\d+$/.test(id)) throw new AppError('INVALID_ARGUMENT', '邮件 ID 必须是 inbox/search/today 返回的数字短 ID。');
+    if (!/^\d+$/.test(id)) throw new AppError('INVALID_ARGUMENT', '邮件 ID 必须是 list/today/inbox/search 返回的数字短 ID。');
     if (!/^[1-9]\d*$/.test(attachmentId)) throw new AppError('INVALID_ARGUMENT', '附件 ID 必须是 attachments/read 返回的正整数。');
     const directory = resolve(outputDirectory);
     await mkdir(directory, { recursive: true });

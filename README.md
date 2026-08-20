@@ -14,6 +14,8 @@ webmail inspect --json
 webmail inbox --limit 20 --json
 webmail inbox --unread --json
 webmail inbox --dir "投后" --limit 20 --json
+webmail list --json
+webmail list --date 2026-08-19 --dir "收件箱/投后" --json
 webmail today --json
 webmail today --dir "收件箱/投后" --json
 webmail search "风险报告" --limit 20 --json
@@ -21,20 +23,25 @@ webmail folders --json
 webmail inspect-message --json
 webmail read 3 --json
 webmail attachments 3 --json
+webmail reply 3 --content "收到，谢谢。" --json
+webmail reply 3 --content "请相关同事一并查看。" --replyall true --draft true --json
+webmail reply 3 --content "收到，谢谢。" --draft false --json
 webmail download 3 1 --output ./downloads --json
 webmail export 3 --output /path/to/obsidian-vault/邮件 --json
 webmail move 3 "投后" --yes --json
 webmail delete 3 --yes --json
 ```
 
-`read`、`download`、`move`、`delete` 使用最近一次 `inbox/search/today` 产生的 Session 短 ID；
+`read`、`reply`、`download`、`move`、`delete` 使用最近一次 `list/today/inbox/search` 产生的 Session 短 ID；
 再次运行列表命令会重新生成这些 ID。移动或删除成功后会清空旧 Session，必须重新运行列表命令。
 
 - `folders`：递归展开并列出 Inbox 下的全部子目录，返回可供 `--dir` 使用的 `name` 和 `path`。
 - `inbox`：不传 `--dir` 时列 Inbox；传入时列指定 Inbox 子目录。完整 `path` 优先于名称。
+- `list`：列出指定日期和目录的全部邮件。`--date` 省略或为空时使用上海时区的今天；`--dir` 省略或为空时使用 Inbox。返回值包含最终解析的 `date` 和 `directory`。
 - `today`：不传 `--dir` 时列 Inbox 当日邮件；传入时列指定子目录的当日邮件。
 - `read`：返回邮件头、纯文本正文和附件元数据。
 - `attachments`：只返回附件名称和大小。
+- `reply`：`--content` 提供正文；`--replyall` 默认 `false`，设为 `true` 时全部答复；`--draft` 默认 `true`，生成并打开草稿交给用户手工发送。只有显式传入 `--draft false` 才会自动点击发送，并在编辑器关闭后报告成功。
 - `download`：将指定附件下载到本地目录并返回绝对路径和字节数。
 - `export`：将一封邮件导出为带 YAML 属性的 Obsidian Markdown；全部附件下载到相对的 `attachments/<邮件标识>/` 目录，并在 Markdown 中生成可点击的相对链接。同名导出自动增加序号，不覆盖已有文件。
 - `move`：只接受移动菜单中完全匹配的目录名，并要求 `--yes`。

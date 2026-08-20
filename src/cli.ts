@@ -18,6 +18,13 @@ function parseLimit(value: string): number {
   return limit;
 }
 
+function parseBoolean(value: string): boolean {
+  const normalized = value.normalize('NFKC').trim().toLowerCase();
+  if (normalized === 'true') return true;
+  if (normalized === 'false') return false;
+  throw new InvalidArgumentError('必须是 true 或 false');
+}
+
 async function execute<T>(json: boolean, operation: () => Promise<T>): Promise<void> {
   try {
     const data = await operation();
@@ -90,6 +97,19 @@ export function createProgram(service = new OutlookService(new EgoLiteBackend())
     });
 
   program
+    .command('list')
+    .description('按日期列出 Inbox 或指定子目录中的全部邮件')
+    .option('--date <date>', '日期（YYYY-MM-DD）；省略或为空时使用今天')
+    .option('--dir <directory>', 'Inbox 子目录名称或 folders 返回的完整 path；省略或为空时使用 Inbox')
+    .option('--json', '输出单一 JSON envelope')
+    .action(async (options: { date?: string; dir?: string; json?: boolean }) => {
+      await execute(Boolean(options.json), () => service.listByDate({
+        date: options.date,
+        directory: options.dir,
+      }));
+    });
+
+  program
     .command('today')
     .description('列出 Inbox 或指定子目录中今天收到的全部邮件')
     .option('--dir <directory>', 'Inbox 子目录名称或 folders 返回的完整 path')
@@ -109,7 +129,7 @@ export function createProgram(service = new OutlookService(new EgoLiteBackend())
   program
     .command('read')
     .description('按当前 Session 短 ID 读取唯一邮件')
-    .argument('<id>', 'inbox/search 返回的数字短 ID')
+    .argument('<id>', 'list/today/inbox/search 返回的数字短 ID')
     .option('--json', '输出单一 JSON envelope')
     .action(async (id: string, options: { json?: boolean }) => {
       await execute(Boolean(options.json), () => service.read(id));
@@ -118,16 +138,33 @@ export function createProgram(service = new OutlookService(new EgoLiteBackend())
   program
     .command('attachments')
     .description('列出邮件附件元数据，不下载附件')
-    .argument('<id>', 'inbox/search 返回的数字短 ID')
+    .argument('<id>', 'list/today/inbox/search 返回的数字短 ID')
     .option('--json', '输出单一 JSON envelope')
     .action(async (id: string, options: { json?: boolean }) => {
       await execute(Boolean(options.json), () => service.attachments(id));
     });
 
   program
+    .command('reply')
+    .description('回复一封邮件；默认生成草稿，显式关闭 draft 时自动发送')
+    .argument('<id>', 'list/today/inbox/search 返回的邮件数字短 ID')
+    .requiredOption('--content <text>', '回复正文')
+    .option('--draft <boolean>', 'true 时交给用户手工发送；false 时自动发送', parseBoolean, true)
+    .option('--replyall <boolean>', 'true 时全部答复；false 时只答复发件人', parseBoolean, false)
+    .option('--json', '输出单一 JSON envelope')
+    .action(async (id: string, options: { content: string; draft: boolean; replyall: boolean; json?: boolean }) => {
+      await execute(Boolean(options.json), () => service.reply(
+        id,
+        options.content,
+        options.draft,
+        options.replyall,
+      ));
+    });
+
+  program
     .command('download')
     .description('下载指定邮件附件到本地目录')
-    .argument('<id>', 'inbox/search/today 返回的邮件数字短 ID')
+    .argument('<id>', 'list/today/inbox/search 返回的邮件数字短 ID')
     .argument('<attachment-id>', 'read/attachments 返回的附件数字短 ID')
     .option('-o, --output <directory>', '下载目录', 'downloads')
     .option('--json', '输出单一 JSON envelope')
@@ -138,7 +175,7 @@ export function createProgram(service = new OutlookService(new EgoLiteBackend())
   program
     .command('export')
     .description('将一封邮件导出为 Obsidian Markdown，并下载全部附件')
-    .argument('<id>', 'inbox/search/today 返回的邮件数字短 ID')
+    .argument('<id>', 'list/today/inbox/search 返回的邮件数字短 ID')
     .requiredOption('-o, --output <directory>', 'Markdown 导出目录')
     .option('--json', '输出单一 JSON envelope')
     .action(async (id: string, options: { output: string; json?: boolean }) => {
@@ -148,7 +185,7 @@ export function createProgram(service = new OutlookService(new EgoLiteBackend())
   program
     .command('move')
     .description('将邮件移动到完全匹配的 Outlook 目录')
-    .argument('<id>', 'inbox/search/today 返回的邮件数字短 ID')
+    .argument('<id>', 'list/today/inbox/search 返回的邮件数字短 ID')
     .argument('<folder>', 'folders 返回的精确目录名')
     .option('--yes', '确认执行移动')
     .option('--json', '输出单一 JSON envelope')
@@ -159,7 +196,7 @@ export function createProgram(service = new OutlookService(new EgoLiteBackend())
   program
     .command('delete')
     .description('将邮件移入“已删除邮件”')
-    .argument('<id>', 'inbox/search/today 返回的邮件数字短 ID')
+    .argument('<id>', 'list/today/inbox/search 返回的邮件数字短 ID')
     .option('--yes', '确认执行删除')
     .option('--json', '输出单一 JSON envelope')
     .action(async (id: string, options: { yes?: boolean; json?: boolean }) => {

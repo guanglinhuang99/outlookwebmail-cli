@@ -6,6 +6,7 @@ import type {
   MessageActionResult,
   MessageLocator,
   MessageOpenResult,
+  ReplyActionResult,
 } from '../types/mail.js';
 
 export interface BrowserBackend {
@@ -29,4 +30,5 @@ export interface BrowserBackend {
   deleteMessage(locator: MessageLocator): Promise<MessageActionResult>;
   moveMessage(locator: MessageLocator, folder: string): Promise<MessageActionResult>;
   downloadAttachment(locator: MessageLocator, attachmentIndex: number, outputDirectory: string): Promise<AttachmentDownloadResult>;
+  replyMessage(locator: MessageLocator, content: string, draft: boolean, replyAll: boolean): Promise<ReplyActionResult>;
 }

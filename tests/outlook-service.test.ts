@@ -52,6 +52,10 @@ function createBackend(searchValue = ''): BrowserBackend {
     moveMessage: vi.fn().mockResolvedValue({
       matchCount: 1, status: 'performed', performed: true, verified: true,
     }),
+    replyMessage: vi.fn().mockResolvedValue({
+      matchCount: 1, status: 'draft_ready', performed: true, verified: true,
+      draft: true, replyAll: false, handedOff: true,
+    }),
     downloadAttachment: vi.fn().mockResolvedValue({
       matchCount: 1, status: 'performed', performed: true, verified: true,
       attachmentCount: 1, attachmentId: '1', filename: 'report.xlsx', path: '/tmp/report.xlsx', bytes: 12,
@@ -115,8 +119,9 @@ describe('OutlookService mail listing', () => {
     const result = await service.today();
 
     expect(result.messages).toHaveLength(2);
+    expect(result.date).toBe('2026-08-20');
     expect(result.directory).toMatchObject({ path: '收件箱' });
-    await expect(store.read()).resolves.toMatchObject({ source: 'today:收件箱:2026-08-20' });
+    await expect(store.read()).resolves.toMatchObject({ source: 'date:收件箱:2026-08-20' });
   });
 
   it('lists today messages from an explicitly selected Inbox child directory', async () => {
@@ -128,7 +133,48 @@ describe('OutlookService mail listing', () => {
 
     expect(backend.selectInboxFolder).toHaveBeenCalledWith('收件箱/投后');
     expect(result.directory).toMatchObject({ path: '收件箱/投后' });
-    await expect(store.read()).resolves.toMatchObject({ source: 'today:收件箱/投后:2026-08-20' });
+    await expect(store.read()).resolves.toMatchObject({ source: 'date:收件箱/投后:2026-08-20' });
+  });
+
+  it('lists a specified date from a specified Inbox child directory', async () => {
+    const { service, backend, parser, store } = await createService();
+    const previousDay: RawMessageRow = {
+      ...rows[0]!, subject: '昨日邮件', receivedAt: '2026-08-19T16:00:00+08:00', receivedAtText: '昨日 16:00',
+    };
+    const older: RawMessageRow = {
+      ...rows[0]!, subject: '更早邮件', receivedAt: '2026-08-18T16:00:00+08:00', receivedAtText: '周二 16:00',
+    };
+    vi.mocked(parser.resetAndExtract).mockResolvedValueOnce(rows);
+    vi.mocked(parser.scrollAndExtract).mockResolvedValueOnce([previousDay, older]);
+
+    const result = await service.listByDate({ date: '2026-08-19', directory: '收件箱/投后' });
+
+    expect(result).toMatchObject({ date: '2026-08-19', directory: { path: '收件箱/投后' } });
+    expect(result.messages.map(message => message.subject)).toEqual(['昨日邮件']);
+    expect(backend.selectInboxFolder).toHaveBeenCalledWith('收件箱/投后');
+    await expect(store.read()).resolves.toMatchObject({ source: 'date:收件箱/投后:2026-08-19' });
+  });
+
+  it('treats empty date and directory options as today and Inbox', async () => {
+    vi.useFakeTimers();
+    vi.setSystemTime(new Date('2026-08-20T02:00:00.000Z'));
+    const { service, backend } = await createService();
+
+    const result = await service.listByDate({ date: '   ', directory: '   ' });
+
+    expect(result.date).toBe('2026-08-20');
+    expect(result.directory).toMatchObject({ path: '收件箱' });
+    expect(backend.selectInboxFolder).toHaveBeenCalledWith(null);
+  });
+
+  it('rejects malformed and impossible dates before opening Outlook', async () => {
+    const { service, backend } = await createService();
+
+    await expect(service.listByDate({ date: '20-08-2026' }))
+      .rejects.toMatchObject({ code: 'INVALID_ARGUMENT' });
+    await expect(service.listByDate({ date: '2026-02-30' }))
+      .rejects.toMatchObject({ code: 'INVALID_ARGUMENT' });
+    expect(backend.status).not.toHaveBeenCalled();
   });
 
   it('returns validated Outlook folders', async () => {
@@ -289,6 +335,82 @@ describe('OutlookService mail listing', () => {
       status: 'performed', filename: 'report.xlsx', verified: true,
     });
     expect(backend.downloadAttachment).toHaveBeenCalledWith(expect.any(Object), 0, directory);
+  });
+
+  it('creates a reply draft by default and hands it to the user', async () => {
+    const { service, backend, store } = await createService();
+    await store.write({
+      version: 1, updatedAt: '2026-08-20T01:00:00.000Z', source: 'inbox',
+      messages: {
+        '1': {
+          subject: '测试主题', senderName: '张三', senderAddress: 'zhangsan@example.com',
+          receivedAt: '2026-08-20T09:30:00+08:00', receivedAtText: '9:30',
+          preview: '测试预览', hasAttachments: false,
+        },
+      },
+    });
+
+    await expect(service.reply('1', '收到，谢谢。')).resolves.toEqual({
+      id: '1', draft: true, replyAll: false, sent: false,
+      requiresManualSend: true, handedOff: true, verified: true,
+    });
+    expect(backend.replyMessage).toHaveBeenCalledWith(
+      expect.objectContaining({ subject: '测试主题' }),
+      '收到，谢谢。',
+      true,
+      false,
+    );
+  });
+
+  it('automatically sends a reply-all only when draft is explicitly false', async () => {
+    const { service, backend, store } = await createService();
+    await store.write({
+      version: 1, updatedAt: '2026-08-20T01:00:00.000Z', source: 'inbox',
+      messages: {
+        '1': {
+          subject: '测试主题', senderName: '张三', senderAddress: 'zhangsan@example.com',
+          receivedAt: '2026-08-20T09:30:00+08:00', receivedAtText: '9:30',
+          preview: '测试预览', hasAttachments: false,
+        },
+      },
+    });
+    vi.mocked(backend.replyMessage).mockResolvedValueOnce({
+      matchCount: 1, status: 'sent', performed: true, verified: true,
+      draft: false, replyAll: true, handedOff: false,
+    });
+
+    await expect(service.reply('1', '请大家查收。', false, true)).resolves.toEqual({
+      id: '1', draft: false, replyAll: true, sent: true,
+      requiresManualSend: false, handedOff: false, verified: true,
+    });
+    expect(backend.replyMessage).toHaveBeenCalledWith(expect.any(Object), '请大家查收。', false, true);
+  });
+
+  it('rejects an empty reply before opening Outlook', async () => {
+    const { service, backend } = await createService();
+
+    await expect(service.reply('1', '   ')).rejects.toMatchObject({ code: 'INVALID_ARGUMENT' });
+    expect(backend.status).not.toHaveBeenCalled();
+    expect(backend.replyMessage).not.toHaveBeenCalled();
+  });
+
+  it('does not report success when reply content cannot be verified', async () => {
+    const { service, backend, store } = await createService();
+    await store.write({
+      version: 1, updatedAt: '2026-08-20T01:00:00.000Z', source: 'inbox',
+      messages: {
+        '1': {
+          subject: '测试主题', senderName: null, senderAddress: null,
+          receivedAt: null, receivedAtText: null, preview: null, hasAttachments: false,
+        },
+      },
+    });
+    vi.mocked(backend.replyMessage).mockResolvedValueOnce({
+      matchCount: 1, status: 'content_not_verified', performed: true, verified: false,
+      draft: true, replyAll: false, handedOff: true,
+    });
+
+    await expect(service.reply('1', '测试内容')).rejects.toMatchObject({ code: 'OPERATION_FAILED' });
   });
 
   it('exports one message and downloaded attachments as Obsidian Markdown', async () => {
