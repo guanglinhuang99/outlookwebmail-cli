@@ -138,6 +138,26 @@ webmail delete m_xxxxxxxxxxxxxxxxxxxx --yes --request-id delete-20260820-001 --j
 不同参数。状态保存在 `~/.webmail-cli/mutations.json`，脱敏审计保存在
 `~/.webmail-cli/audit.jsonl`。
 
+### 导出单封邮件
+
+`export` 支持 `md` 和 `eml` 两种格式，`--format` 省略时默认使用 `md`：
+
+```bash
+# 等同于 --format md：生成 Obsidian Markdown，并把附件下载到 attachments 子目录
+webmail export m_xxxxxxxxxxxxxxxxxxxx --output /path/to/obsidian-vault/邮件 --json
+
+# 通过 Outlook“文件 → 下载 → 下载为 EML”取得原始 EML
+webmail export m_xxxxxxxxxxxxxxxxxxxx --output ./eml --format eml --json
+```
+
+`md` 结果返回 `markdownPath`、`attachmentDirectory`、附件路径和相对链接；`eml` 结果返回 `emlPath`、
+`attachmentCount` 和文件字节数。两种格式遇到同名文件时都会增加序号，不覆盖已有导出。
+
+EML 不是由 CLI 根据 DOM 重建；CLI 打开唯一目标邮件并调用 Outlook 自带的“文件 → 下载 → 下载为 EML”，
+因此保留 Outlook 提供的原始邮件头、HTML/纯文本正文、MIME 结构和附件。下载完成后先验证 `.eml` 文件已经
+落盘，再安全移动到目标目录。`--format` 目前只用于单封 `export`；`export-batch` 和 `sync-obsidian`
+仍然输出 Obsidian Markdown。
+
 Obsidian 增量同步和新邮件监控：
 
 ```bash
@@ -193,7 +213,8 @@ webmail archive 3 --yes --request-id archive-20260820-001 --json
 webmail conversation 3 --json
 webmail download 3 1 --output ./downloads --json
 webmail download-all 3 --output ./downloads --json
-webmail export 3 --output /path/to/obsidian-vault/邮件 --json
+webmail export 3 --output /path/to/obsidian-vault/邮件 --format md --json
+webmail export 3 --output ./eml --format eml --json
 webmail export-batch --date 2026-08-20 --dir "收件箱/投后" --output /path/to/obsidian-vault/邮件 --json
 webmail sync-obsidian --date 2026-08-20 --dir "收件箱/投后" --output /path/to/obsidian-vault/邮件 --json
 webmail watch --dir "收件箱/投后" --interval 30
@@ -280,7 +301,7 @@ macOS/Linux 使用 `export WEBMAIL_BACKEND=playwright`；Windows `cmd.exe` 使�
 - `conversation`：返回阅读窗格中已经加载的整段会话；`complete: false` 表示页面仍存在未展开的会话内容，Agent 不应把结果当作完整线程。
 - `download`：将指定附件下载到本地目录并返回绝对路径和字节数。
 - `download-all`：下载一封邮件的全部附件，计算每个文件的 SHA-256；遇到本地同名文件时自动增加序号，绝不覆盖原文件。
-- `export`：将一封邮件导出为带 YAML 属性的 Obsidian Markdown；全部附件下载到相对的 `attachments/<邮件标识>/` 目录，并在 Markdown 中生成可点击的相对链接。同名导出自动增加序号，不覆盖已有文件。
+- `export`：通过 `--format md|eml` 选择格式，默认 `md`。`md` 导出带 YAML 属性的 Obsidian Markdown，附件下载到相对的 `attachments/<邮件标识>/` 目录并生成链接；`eml` 调用 Outlook“文件 → 下载 → 下载为 EML”取得原始邮件文件，附件保留在原始 MIME 中。同名导出自动增加序号，不覆盖已有文件。
 - `export-batch`：复用 `list` 的日期、目录和筛选参数，逐页导出全部匹配邮件及附件；最多处理 100 页，防止异常页面导致无限循环。
 - `sync-obsidian`：增量同步指定日期/范围和目录中的邮件。使用目标目录下的
   `.webmail-cli-index.json` 按 `stableId` 去重，未变化邮件不会重复下载；变化邮件更新原 Markdown，

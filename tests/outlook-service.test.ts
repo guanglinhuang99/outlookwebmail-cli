@@ -122,6 +122,10 @@ function createBackend(searchValue = ''): BrowserBackend {
       matchCount: 1, status: 'performed', performed: true, verified: true,
       attachmentCount: 1, attachmentId: '1', filename: 'report.xlsx', path: '/tmp/report.xlsx', bytes: 12,
     }),
+    downloadMessageAsEml: vi.fn().mockResolvedValue({
+      matchCount: 1, status: 'performed', performed: true, verified: true,
+      attachmentCount: 0, filename: 'message.eml', path: '/tmp/message.eml', bytes: 12,
+    }),
   } as unknown as BrowserBackend;
   return backend;
 }
@@ -792,6 +796,56 @@ describe('OutlookService mail listing', () => {
     expect(markdown).toContain('## 正文\n\n测试正文');
     expect(markdown).toContain(`](${result.attachments[0]?.link})`);
     await expect(stat(result.attachments[0]!.path)).resolves.toMatchObject({ size: 10 });
+  });
+
+  it('keeps Markdown as the default export format', async () => {
+    const { service } = await createService();
+    const outputDirectory = temporaryDirectories[temporaryDirectories.length - 1]!;
+    const markdownPath = join(outputDirectory, 'message.md');
+    vi.spyOn(service, 'exportObsidian').mockResolvedValue({
+      id: '1', markdownPath, attachmentDirectory: null, attachments: [], bytes: 12,
+    });
+
+    const result = await service.exportMessage('1', outputDirectory);
+
+    expect(result).toMatchObject({ format: 'md' });
+    expect(service.exportObsidian).toHaveBeenCalledWith('1', outputDirectory);
+  });
+
+  it('exports the native EML downloaded by Outlook without rebuilding it from DOM fields', async () => {
+    const { backend, service, store } = await createService();
+    await store.write({
+      version: 1, updatedAt: '2026-08-20T01:00:00.000Z', source: 'inbox',
+      messages: {
+        '1': {
+          subject: '测试主题', senderName: '张三', senderAddress: 'zhangsan@example.com',
+          receivedAt: '2026-08-20T09:30:00+08:00', receivedAtText: '9:30',
+          preview: '测试预览', hasAttachments: true,
+        },
+      },
+    });
+    vi.mocked(backend.downloadMessageAsEml).mockImplementation(async (_locator, outputDirectory) => {
+      const path = join(outputDirectory, 'Outlook 原始邮件.eml');
+      await writeFile(path, 'native-eml-content');
+      return {
+        matchCount: 1, status: 'performed', performed: true, verified: true,
+        attachmentCount: 1, filename: 'Outlook 原始邮件.eml', path, bytes: 18,
+      };
+    });
+    const outputDirectory = temporaryDirectories[temporaryDirectories.length - 1]!;
+
+    const result = await service.exportMessage('1', outputDirectory, 'eml');
+    expect(result).toMatchObject({ format: 'eml', filename: 'Outlook 原始邮件.eml', attachmentCount: 1, bytes: 18 });
+    if (result.format !== 'eml') throw new Error('Expected EML export');
+    await expect(readFile(result.emlPath, 'utf8')).resolves.toBe('native-eml-content');
+    expect(backend.downloadMessageAsEml).toHaveBeenCalledWith(expect.objectContaining({ subject: '测试主题' }), expect.any(String));
+    expect(backend.downloadAttachment).not.toHaveBeenCalled();
+
+    const repeated = await service.exportMessage('1', outputDirectory, 'eml');
+    expect(repeated).toMatchObject({ format: 'eml', filename: 'Outlook 原始邮件 (2).eml' });
+    if (repeated.format !== 'eml') throw new Error('Expected EML export');
+    await expect(readFile(result.emlPath, 'utf8')).resolves.toBe('native-eml-content');
+    await expect(readFile(repeated.emlPath, 'utf8')).resolves.toBe('native-eml-content');
   });
 
   it('creates a new mail draft by default without requiring a request ID', async () => {

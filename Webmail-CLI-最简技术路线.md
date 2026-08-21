@@ -1,6 +1,6 @@
 # Webmail CLI 最简技术路线（Ego Lite 优先）
 
-> 历史说明：本文记录项目最初的 Ego Lite-only 方案和编码提示，不是当前实现的完整使用手册。当前版本已经增加 Playwright、Edge 共享、MCP、Obsidian 同步、跨平台打包以及统一启动模式；请以 [README.md](README.md) 和 [playwright-backend.md](playwright-backend.md) 为准。
+> 历史说明：本文记录项目最初的 Ego Lite-only 方案和编码提示，不是当前实现的完整使用手册。当前版本已经增加 Playwright、Edge 共享、MCP、Obsidian 同步、Markdown/EML 邮件导出、跨平台打包以及统一启动模式；请以 [README.md](README.md) 和 [playwright-backend.md](playwright-backend.md) 为准。
 
 > 版本：v1.0
 > 目标：把已经登录的 `https://partner.outlook.cn/mail/` Webmail 变成一个本地 CLI，供 Codex / Claude Code / OpenCode 等 AI 通过 shell 直接调用。

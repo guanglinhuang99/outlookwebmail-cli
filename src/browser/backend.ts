@@ -10,6 +10,7 @@ import type {
   ForwardOptions,
   InboxFolderListResult,
   MessageActionResult,
+  MessageDownloadResult,
   MessageStateActionResult,
   MessageLocator,
   MessageOpenResult,
@@ -40,6 +41,7 @@ export interface BrowserBackend {
   deleteMessage(locator: MessageLocator): Promise<MessageActionResult>;
   moveMessage(locator: MessageLocator, folder: string): Promise<MessageActionResult>;
   downloadAttachment(locator: MessageLocator, attachmentIndex: number, outputDirectory: string): Promise<AttachmentDownloadResult>;
+  downloadMessageAsEml(locator: MessageLocator, outputDirectory: string): Promise<MessageDownloadResult>;
   replyMessage(locator: MessageLocator, content: string, draft: boolean, replyAll: boolean): Promise<ReplyActionResult>;
   composeMessage(options: ComposeOptions): Promise<ComposeActionResult>;
   forwardMessage(locator: MessageLocator, options: ForwardOptions): Promise<ComposeActionResult>;

@@ -17,5 +17,10 @@ webmail-cli Windows 安装说明
 - webmail：CLI
 - webmail-mcp：供 MCP 客户端启动的 stdio Server
 
+导出邮件：
+- 默认 Obsidian Markdown：webmail export m_xxxxxxxxxxxxxxxxxxxx --output .\exports
+- EML（附件嵌入文件）：webmail export m_xxxxxxxxxxxxxxxxxxxx --output .\exports --format eml
+- 邮件 ID 来自 webmail list 或 webmail search，建议使用返回的 stableId。
+
 详细用法见项目 README：
 https://github.com/guanglinhuang99/outlookwebmail-cli

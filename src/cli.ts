@@ -416,12 +416,13 @@ export function createProgram(service = new OutlookService(createBrowserBackend(
 
   program
     .command('export')
-    .description('将一封邮件导出为 Obsidian Markdown，并下载全部附件')
+    .description('将一封邮件导出为 Obsidian Markdown 或 EML；默认 Markdown')
     .argument('<id>', '列表返回的数字短 ID 或 stableId')
-    .requiredOption('-o, --output <directory>', 'Markdown 导出目录')
+    .requiredOption('-o, --output <directory>', '导出目录')
+    .addOption(new Option('--format <format>', '导出格式').choices(['md', 'eml']).default('md'))
     .option('--json', '输出单一 JSON envelope')
-    .action(async (id: string, options: { output: string; json?: boolean }) => {
-      await execute(Boolean(options.json), () => service.exportObsidian(id, options.output));
+    .action(async (id: string, options: { output: string; format: 'md' | 'eml'; json?: boolean }) => {
+      await execute(Boolean(options.json), () => service.exportMessage(id, options.output, options.format));
     });
 
   program

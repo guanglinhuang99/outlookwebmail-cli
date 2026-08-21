@@ -16,6 +16,8 @@ import type {
   FolderSummary,
   ForwardOptions,
   ForwardResult,
+  MailExportFormat,
+  MailExportResult,
   MailMessage,
   MailSummary,
   MessageActionResult,
@@ -245,7 +247,7 @@ async function copyWithoutOverwrite(source: string, directory: string, preferred
       if ((error as NodeJS.ErrnoException).code !== 'EEXIST') throw error;
     }
   }
-  throw new AppError('OPERATION_FAILED', `附件 ${preferredFilename} 的同名文件过多，无法生成安全文件名。`);
+  throw new AppError('OPERATION_FAILED', `文件 ${preferredFilename} 的同名版本过多，无法生成安全文件名。`);
 }
 
 function requirePageUrl(page: { url?: string; dialog?: unknown }): string {
@@ -1334,6 +1336,41 @@ export class OutlookService {
       attachments,
       bytes,
     };
+  }
+
+  async exportMessage(id: string, outputDirectory: string, format: MailExportFormat = 'md'): Promise<MailExportResult> {
+    if (format === 'md') return { ...await this.exportObsidian(id, outputDirectory), format: 'md' };
+    if (format !== 'eml') throw new AppError('INVALID_ARGUMENT', 'format 必须是 md 或 eml。');
+    if (!outputDirectory.normalize('NFKC').trim()) {
+      throw new AppError('INVALID_ARGUMENT', '导出目录不能为空。');
+    }
+
+    validateMailId(id);
+    const directory = resolve(outputDirectory);
+    await mkdir(directory, { recursive: true });
+    const stagingDirectory = await mkdtemp(join(directory, '.webmail-eml-'));
+    try {
+      await this.ensureReady();
+      const downloaded = await this.backend.downloadMessageAsEml(await this.sessionLocator(id), stagingDirectory);
+      this.assertPerformed(id, downloaded);
+      if (!downloaded.path || !downloaded.filename || downloaded.bytes === undefined) {
+        throw new AppError('OPERATION_FAILED', 'Outlook EML 下载结果缺少文件信息。');
+      }
+      const preferredFilename = downloaded.filename.toLowerCase().endsWith('.eml')
+        ? downloaded.filename
+        : `${downloaded.filename}.eml`;
+      const saved = await copyWithoutOverwrite(downloaded.path, directory, preferredFilename);
+      return {
+        id,
+        format: 'eml',
+        filename: saved.filename,
+        emlPath: saved.path,
+        attachmentCount: downloaded.attachmentCount ?? 0,
+        bytes: downloaded.bytes,
+      };
+    } finally {
+      await rm(stagingDirectory, { recursive: true, force: true });
+    }
   }
 
   async exportBatch(options: DatedMailListOptions, outputDirectory: string): Promise<{
