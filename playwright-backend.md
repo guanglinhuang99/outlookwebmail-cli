@@ -219,7 +219,7 @@ await page.goto(config.outlookUrl, { waitUntil: 'domcontentloaded' });
 
 目录为空时仍映射为 Inbox，日期为空时由服务层解析为今天。Playwright 后端不能自行改变这些默认值，否则 Ego Lite 和 Playwright 的结果会不一致。
 
-### 7.3 附件和 Obsidian 导出
+### 7.3 附件和邮件导出
 
 `downloadAttachment()` 使用 Playwright 下载事件：
 
@@ -237,6 +237,10 @@ await download.saveAs(safeOutputPath);
 - 保存后检查文件存在、大小和最终路径；
 - 返回现有 `AttachmentDownloadResult`，不把临时下载路径暴露给用户；
 - Obsidian Markdown 仍由现有导出层生成，附件链接使用导出目录内的相对路径；
+- `export --format eml` 打开唯一目标邮件，依次操作“文件 / File → 下载 / Download → 下载为 EML / Download as EML”；
+- 浏览器只接受本次新出现且扩展名为 `.eml` 的下载，菜单缺失、目标不唯一或下载超时都返回失败；
+- 服务层原样移动 Outlook 下载的 EML，不根据 DOM 字段重新编码，因此保留 Outlook 提供的原始邮件头、正文、MIME 结构和附件；
+- EML 下载先落到临时目录，验证成功后移动到目标目录；同名 `.eml` 自动增加序号且不覆盖；
 - 如果下载按钮触发新窗口或弹出菜单，需要先等待对应 locator，再监听 `download`。
 
 ### 7.4 写操作、草稿和回复
@@ -307,7 +311,7 @@ CLI 进程在该模式下应保持 Context 存活，直到用户按回车确认�
 - 删除、移动、归档、标记、发送仍由现有确认策略控制；
 - `draft=true` 永远不能点击发送；
 - `draft=false` 必须经过现有 request-id 幂等和审计流程；
-- 下载文件名和 Markdown 链接必须防止路径穿越；
+- 下载文件名、Markdown 链接和 EML 输出路径必须防止路径穿越；只接受 Outlook 菜单触发的 `.eml` 下载；
 - 不实现 Cookie 导出、密码抓取或绕过 MFA；
 - 进程收到 SIGINT/SIGTERM 时先停止新动作，再关闭页面/Context，避免半完成写操作。
 
@@ -329,6 +333,7 @@ CLI 进程在该模式下应保持 Context 存活，直到用户按回车确认�
 - 按日期列出邮件；
 - 打开邮件并解析正文/附件；
 - 下载附件并生成相对链接；
+- 分别执行 `export --format md` 和 `export --format eml`，并将后者与 Outlook 手工“下载为 EML”逐字节比较；
 - 保存草稿、回复全部、转发；
 - 删除/移动/标记动作的后置条件和失败回滚提示。
 
@@ -371,9 +376,11 @@ CLI 进程在该模式下应保持 Context 存活，直到用户按回车确认�
 
 - 实现目录树、Inbox/目录选择、列表、日期过滤、搜索；
 - 实现邮件详情、附件列表和单附件下载；
-- 验证 Obsidian 导出中的附件相对链接。
+- 验证 Obsidian 导出中的附件相对链接；
+- 实现 Outlook 菜单原生 EML 下载，文件验证完成后清理临时下载目录。
 
-验收：CLI 现有 list/read/search/export/download 命令不需要改业务参数即可切换后端。
+验收：CLI 现有 list/read/search/export/download 命令不需要改业务参数即可切换后端；`export` 的
+`md` 默认值和 `eml` 输出在两种后端下保持一致。
 
 ### 已完成：写操作和安全策略接入
 
@@ -399,7 +406,7 @@ CLI 进程在该模式下应保持 Context 存活，直到用户按回车确认�
 
 1. Windows、macOS、Linux 均可在安装 Chrome/Edge/Chromium 后运行，不依赖 Ego Lite App；
 2. 首次运行只需要用户在可见窗口手工登录，后续运行复用专用 Profile；
-3. 目录清单、目录邮件清单、指定日期邮件、搜索、阅读、附件下载和 Obsidian 导出结果与现有后端保持一致；
+3. 目录清单、目录邮件清单、指定日期邮件、搜索、阅读、附件下载、Obsidian Markdown 和 EML 导出结果在两个后端间保持一致；
 4. 回复支持 `replyAll`，`draft=true` 不发送，`draft=false` 经过确认并验证发送结果；
 5. 删除、移动、标记和归档不会绕过现有安全策略；
 6. 浏览器缺失、Profile 锁、登录过期、UI 变化和下载失败都有可操作的错误提示；

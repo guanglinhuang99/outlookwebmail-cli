@@ -12,6 +12,7 @@ import type {
   ForwardOptions,
   InboxFolderListResult,
   MessageActionResult,
+  MessageDownloadResult,
   MessageStateActionResult,
   MessageLocator,
   MessageOpenResult,
@@ -1618,5 +1619,110 @@ if (!target) {
 }
 `;
     return (await this.runner.run<AttachmentDownloadResult>(script, 110_000)).value;
+  }
+
+  async downloadMessageAsEml(
+    locator: MessageLocator,
+    outputDirectory: string,
+  ): Promise<MessageDownloadResult> {
+    const opened = await this.openAndExtractMessage(locator);
+    const failure = actionFailure(opened);
+    if (failure) return failure;
+    const attachmentCount = opened.message?.attachments.length ?? 0;
+
+    const fileControlScript = String.raw`(() => {
+  const visible = el => { const rect=el.getBoundingClientRect(); const style=getComputedStyle(el); return rect.width>0&&rect.height>0&&style.display!=='none'&&style.visibility!=='hidden'; };
+  const clean = value => (value || '').normalize('NFKC').replace(/\s+/g, ' ').trim();
+  const controls = Array.from(document.querySelectorAll('button,[role="button"],[role="menuitem"]')).filter(visible)
+    .filter(el => [el.getAttribute('aria-label'),el.getAttribute('title'),el.textContent].map(clean)
+      .some(value => /^(文件|file)(?:\s*(菜单|menu))?$/i.test(value)));
+  if (controls.length !== 1) return { count: controls.length, rect: null };
+  const rect=controls[0].getBoundingClientRect();
+  return { count: 1, rect: { x: rect.x+rect.width/2, y: rect.y+rect.height/2 } };
+})()`;
+    const downloadControlScript = String.raw`(() => {
+  const visible = el => { const rect=el.getBoundingClientRect(); const style=getComputedStyle(el); return rect.width>0&&rect.height>0&&style.display!=='none'&&style.visibility!=='hidden'; };
+  const clean = value => (value || '').normalize('NFKC').replace(/\s+/g, ' ').trim();
+  const controls = Array.from(document.querySelectorAll('[role="menu"] [role="menuitem"], [role="menu"] button')).filter(visible)
+    .filter(el => [el.getAttribute('aria-label'),el.getAttribute('title'),el.textContent].map(clean)
+      .some(value => /^(下载|download)$/i.test(value)));
+  if (controls.length !== 1) return { count: controls.length, rect: null };
+  const rect=controls[0].getBoundingClientRect();
+  return { count: 1, rect: { x: rect.x+rect.width/2, y: rect.y+rect.height/2 } };
+})()`;
+    const emlControlScript = String.raw`(() => {
+  const visible = el => { const rect=el.getBoundingClientRect(); const style=getComputedStyle(el); return rect.width>0&&rect.height>0&&style.display!=='none'&&style.visibility!=='hidden'; };
+  const clean = value => (value || '').normalize('NFKC').replace(/\s+/g, ' ').trim();
+  const controls = Array.from(document.querySelectorAll('[role="menu"] [role="menuitem"], [role="menu"] button')).filter(visible)
+    .filter(el => [el.getAttribute('aria-label'),el.getAttribute('title'),el.textContent].map(clean)
+      .some(value => /下载为\s*\.?eml(?:\s*文件)?|download as\s*\.?eml(?:\s*file)?/i.test(value)));
+  if (controls.length !== 1) return { count: controls.length, rect: null };
+  const rect=controls[0].getBoundingClientRect();
+  return { count: 1, rect: { x: rect.x+rect.width/2, y: rect.y+rect.height/2 } };
+})()`;
+    const script = `${resumeTaskSpace()}
+const fs = await import('node:fs/promises');
+const pathModule = await import('node:path');
+const outputDirectory = ${JSON.stringify(outputDirectory)};
+await fs.mkdir(outputDirectory, { recursive: true });
+await cdp('Page.setDownloadBehavior', { behavior: 'allow', downloadPath: outputDirectory });
+const before = new Map();
+for (const name of await fs.readdir(outputDirectory)) {
+  const info = await fs.stat(pathModule.join(outputDirectory, name));
+  before.set(name, info.mtimeMs);
+}
+let fileControl = null;
+for (let attempt=0; attempt<20; attempt+=1) {
+  fileControl = await js(${JSON.stringify(fileControlScript)});
+  if (fileControl.rect) break;
+  await wait(0.25);
+}
+if (!fileControl || !fileControl.rect) {
+  ${markedResult(`{ matchCount: 1, status: 'control_not_found', performed: false, verified: false, attachmentCount: ${attachmentCount} }`)}
+} else {
+  await click(fileControl.rect);
+  await wait(0.35);
+  let downloadControl = await js(${JSON.stringify(downloadControlScript)});
+  if (!downloadControl.rect) {
+    await pressKey('Escape');
+    ${markedResult(`{ matchCount: 1, status: 'control_not_found', performed: false, verified: false, attachmentCount: ${attachmentCount} }`)}
+  } else {
+    await hover(downloadControl.rect);
+    await wait(0.35);
+    let emlControl = await js(${JSON.stringify(emlControlScript)});
+    if (!emlControl.rect) {
+      await click(downloadControl.rect);
+      await wait(0.35);
+      emlControl = await js(${JSON.stringify(emlControlScript)});
+    }
+    if (!emlControl.rect) {
+      await pressKey('Escape');
+      ${markedResult(`{ matchCount: 1, status: 'control_not_found', performed: false, verified: false, attachmentCount: ${attachmentCount} }`)}
+    } else {
+      await click(emlControl.rect);
+      let downloaded = null;
+      for (let attempt=0; attempt<60; attempt+=1) {
+        await wait(0.5);
+        for (const name of await fs.readdir(outputDirectory)) {
+          if (!/\\.eml$/i.test(name) || name.endsWith('.crdownload')) continue;
+          const fullPath = pathModule.join(outputDirectory, name);
+          const info = await fs.stat(fullPath);
+          if (info.isFile() && info.size > 0 && (!before.has(name) || before.get(name) !== info.mtimeMs)) {
+            downloaded = { filename: name, path: fullPath, bytes: info.size };
+            break;
+          }
+        }
+        if (downloaded) break;
+      }
+      if (!downloaded) {
+        ${markedResult(`{ matchCount: 1, status: 'download_failed', performed: true, verified: false, attachmentCount: ${attachmentCount} }`)}
+      } else {
+        ${markedResult(`{ matchCount: 1, status: 'performed', performed: true, verified: true, attachmentCount: ${attachmentCount}, ...downloaded }`)}
+      }
+    }
+  }
+}
+`;
+    return (await this.runner.run<MessageDownloadResult>(script, 110_000)).value;
   }
 }

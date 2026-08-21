@@ -131,6 +131,13 @@ export interface AttachmentDownloadResult extends MessageActionResult {
   bytes?: number;
 }
 
+export interface MessageDownloadResult extends MessageActionResult {
+  attachmentCount?: number;
+  filename?: string;
+  path?: string;
+  bytes?: number;
+}
+
 export type ReplyActionStatus =
   | 'draft_ready'
   | 'sent'
@@ -317,6 +324,19 @@ export interface ObsidianExportResult {
   attachments: ExportedAttachment[];
   bytes: number;
 }
+
+export type MailExportFormat = 'md' | 'eml';
+
+export interface EmlExportResult {
+  id: string;
+  format: 'eml';
+  filename: string;
+  emlPath: string;
+  attachmentCount: number;
+  bytes: number;
+}
+
+export type MailExportResult = (ObsidianExportResult & { format: 'md' }) | EmlExportResult;
 
 export type ObsidianSyncStatus = 'created' | 'updated' | 'unchanged';
 
